@@ -1,1 +1,14 @@
 .worktrees/
+.venv-ros/
+.venv-train/
+cache/
+cache-repro/
+artifacts/
+runs/
+*.bag
+*.bag.active
+.pytest_cache/
+__pycache__/
+.superpowers/
+sensor_data/*
+!sensor_data/.gitignore
