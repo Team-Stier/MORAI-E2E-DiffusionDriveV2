@@ -1,6 +1,6 @@
 # MORAI DiffusionDriveV2 입력 도메인 적응 설계
 
-- 상태: 설계 승인됨, 서면 스펙 사용자 검토 대기
+- 상태: 사용자 승인 완료
 - 작성일: 2026-08-06
 - 대상 저장소: MORAI-diffusion-drive-v2
 - 규범적 입력 계약: docs/domain-specs/morai-diffusiondrivev2-v1.md

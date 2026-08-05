@@ -1,7 +1,7 @@
 # MORAI DiffusionDriveV2 Domain Specification v1
 
 - Domain ID: morai-ddv2-v1-oracle-command
-- 상태: 설계 승인됨, 서면 스펙 사용자 검토 대기
+- 상태: 사용자 승인 완료
 - 작성일: 2026-08-06
 - 관련 설계: docs/superpowers/specs/2026-08-06-morai-diffusiondrivev2-domain-adaptation-design.md
 
