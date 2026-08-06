@@ -22,7 +22,9 @@ from morai_ddv2.errors import ConfigurationError, IntegrityError
 EXPECTED_PRESET_SHA256 = "b7e69c70cc0b2948c3a5b352eee022be04f8884a1df135697f89bb4bb88263fb"
 
 
-def _resolve(repo_root: Path) -> ResolvedDomainArtifact:
+def _resolve(
+    repo_root: Path, source_commit: str = "1" * 40
+) -> ResolvedDomainArtifact:
     preset = load_sensor_preset(
         repo_root / "sensor_data" / "0725demo_ros.json",
         EXPECTED_PRESET_SHA256,
@@ -32,7 +34,11 @@ def _resolve(repo_root: Path) -> ResolvedDomainArtifact:
             encoding="utf-8"
         )
     )
-    return resolve_domain(preset=preset, raw_domain=raw_domain, source_commit="1" * 40)
+    return resolve_domain(
+        preset=preset,
+        raw_domain=raw_domain,
+        source_commit=source_commit,
+    )
 
 
 def test_domain_yaml_contains_policy_but_not_preset_owned_sensor_values(repo_root) -> None:
@@ -90,6 +96,16 @@ def test_resolved_domain_hash_excludes_only_its_own_digest(repo_root) -> None:
     assert published["resolved_domain_sha256"] == artifact.sha256
     del published["resolved_domain_sha256"]
     assert published == artifact.document
+
+
+def test_resolved_domain_matches_clean_head_golden_bytes(repo_root) -> None:
+    golden_path = repo_root / "tests" / "fixtures" / "golden" / "resolved-domain.json"
+    golden_bytes = golden_path.read_bytes()
+    golden_document = json.loads(golden_bytes)
+
+    artifact = _resolve(repo_root, source_commit=golden_document["source_code_commit"])
+
+    assert artifact.publication_bytes == golden_bytes
 
 
 def test_resolved_domain_document_is_deeply_immutable(repo_root) -> None:
