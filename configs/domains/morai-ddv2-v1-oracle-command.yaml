@@ -1,0 +1,295 @@
+schema_version: 1
+domain_id: morai-ddv2-v1-oracle-command
+
+sensor_preset:
+  path: sensor_data/0725demo_ros.json
+  sha256: b7e69c70cc0b2948c3a5b352eee022be04f8884a1df135697f89bb4bb88263fb
+  physical_source_path: /home/stier/catkin_ws/src/0725demo.json
+  physical_source_sha256: cbe7dec43bf48299eed6008d03e722ecdfc9a5d21a75130b7c21d99cf9344958
+
+coordinate_conventions:
+  vehicle_frame: base_link
+  global_frame: map
+  x_axis: forward
+  y_axis: left
+  z_axis: up
+  distance_unit: meter
+  angle_unit: radian
+  heading_positive: counter_clockwise
+  heading_range: half_open_negative_pi_to_pi
+  frame_name_normalization: strip_leading_slash
+  trajectory_origin: current_base_link
+  inferred_rear_axle_offset_allowed: false
+
+ros_contract:
+  message_types:
+    camera: sensor_msgs/CompressedImage
+    lidar: sensor_msgs/PointCloud2
+    ego_state: morai_msgs/EgoVehicleStatus
+    transforms: tf2_msgs/TFMessage
+  policy_topics:
+    ego_state: /Ego_topic
+    transforms: /tf
+  pose_transform:
+    parent_frame: map
+    child_frame: base_link
+  ego_feature_fields:
+    - velocity.x
+    - velocity.y
+    - acceleration.x
+    - acceleration.y
+  ego_diagnostic_fields:
+    - position.x
+    - position.y
+    - heading_deg
+  lidar_point_fields:
+    x: float32
+    y: float32
+    z: float32
+    intensity: float32
+
+sampling:
+  timestamp_source: Header.stamp
+  sample_rate_hz: 2.0
+  grid_period_ns: 500000000
+  grid_origin: ceil_first_valid_front_to_period
+  front_grid_tolerance_ns: 50000000
+  side_camera_nearest_tolerance_ns: 30000000
+  lidar_nearest_tolerance_ns: 45000000
+  ego_state_max_bracket_ns: 100000000
+  pose_max_bracket_ns: 100000000
+  nearest_tie_break_order:
+    - absolute_offset_ns
+    - source_stamp_ns
+    - stable_record_index
+  tolerance_boundary_inclusive: true
+  interpolation_exact_match_weight: 0.0
+  interpolation_extrapolation_allowed: false
+  drop_on_required_sensor_miss: true
+
+camera_processing:
+  decoded_layout: HWC
+  decoded_dtype: uint8
+  decoded_color_order: BGR
+  output_color_order: RGB
+  exif_orientation_allowed: false
+  automatic_color_correction_allowed: false
+  interpolation: cv2.INTER_AREA
+  view_order:
+    - left
+    - front
+    - right
+  resize_wh:
+    left: [341, 256]
+    front: [455, 256]
+    right: [341, 256]
+  stitched_wh: [1137, 256]
+  outer_crop_x_start: 56
+  outer_crop_x_end_exclusive: 1080
+  output_wh: [1024, 256]
+  output_boundaries_x: [0, 285, 740, 1024]
+  cache_tensor:
+    name: camera_rgb
+    layout: NHWC
+    dtype: uint8
+    shape_per_sample: [256, 1024, 3]
+    value_range: [0, 255]
+  model_tensor:
+    name: camera_feature
+    layout: NCHW
+    dtype: float32
+    shape_per_sample: [3, 256, 1024]
+    value_range: [0.0, 1.0]
+    conversion: transpose_HWC_to_CHW_then_divide_255
+    imagenet_normalization: false
+
+lidar_processing:
+  ordered_steps:
+    - DROP_ZERO_PADDING
+    - TRANSFORM_TO_BASE_LINK
+    - APPLY_3D_SELF_MASK
+    - APPLY_HEIGHT_FILTER
+    - BUILD_XY_HISTOGRAM
+  zero_padding_point_xyz: [0.0, 0.0, 0.0]
+  self_mask_base_link_m:
+    x: [0.0, 2.0]
+    y: [-1.0, 1.0]
+    z: [0.8, 1.6]
+    boundaries_inclusive: true
+  height_filter_m:
+    min_exclusive: 0.2
+    max_exclusive: 100.0
+  x_range_m: [-32.0, 32.0]
+  y_range_m: [-32.0, 32.0]
+  pixels_per_meter: 4
+  bin_size_m: 0.25
+  bins_xy: [256, 256]
+  histogram_axis_order:
+    - x_bin
+    - y_bin
+  count_clip: 5
+  normalization: divide_by_5
+  rotate_or_flip: false
+  ground_plane_channel: false
+  cache_tensor:
+    name: lidar_count
+    dtype: uint8
+    shape_per_sample: [256, 256]
+    value_range: [0, 5]
+  model_tensor:
+    name: lidar_feature
+    dtype: float32
+    shape_per_sample: [1, 256, 256]
+    value_range: [0.0, 1.0]
+
+status_feature:
+  name: status_feature
+  dtype: float32
+  shape_per_sample: [8]
+  fields:
+    - command_left
+    - command_straight
+    - command_right
+    - command_unknown
+    - velocity_x_mps
+    - velocity_y_mps
+    - acceleration_x_mps2
+    - acceleration_y_mps2
+  frame: base_link
+  normalization: none
+  command_one_hot_required: true
+
+trajectory:
+  name: trajectory
+  dtype: float32
+  shape_per_sample: [8, 3]
+  sampling_offsets_ns:
+    - 500000000
+    - 1000000000
+    - 1500000000
+    - 2000000000
+    - 2500000000
+    - 3000000000
+    - 3500000000
+    - 4000000000
+  fields:
+    - x_m
+    - y_m
+    - relative_heading_rad
+  origin: current_base_link
+  heading_range: half_open_negative_pi_to_pi
+
+command:
+  provenance: future_trajectory_oracle
+  index_mapping:
+    LEFT: 0
+    STRAIGHT: 1
+    RIGHT: 2
+    UNKNOWN: 3
+  thresholds:
+    minimum_path_length_m: 1.0
+    left:
+      minimum_final_heading_rad: 0.2
+      minimum_final_lateral_m: 0.5
+    right:
+      maximum_final_heading_rad: -0.2
+      maximum_final_lateral_m: -0.5
+    straight:
+      maximum_abs_final_heading_rad: 0.1
+      maximum_abs_final_lateral_m: 0.5
+    ambiguous_or_static_class: UNKNOWN
+    nan_allowed: false
+  ordered_rules:
+    - DROP_INVALID_TRAJECTORY
+    - UNKNOWN_STATIC
+    - LEFT
+    - RIGHT
+    - STRAIGHT
+    - UNKNOWN_AMBIGUOUS
+
+diagnostics:
+  extrinsic_translation_tolerance_m: 0.0001
+  extrinsic_rotation_tolerance_rad: 0.0001
+  tf_ego_minimum_comparable_pairs: 10
+  tf_ego_position_p99_tolerance_m: 0.05
+  tf_ego_heading_p99_tolerance_deg: 0.5
+  percentile_method: nearest_rank
+  duplicate_ego_numeric_tolerance: exact
+  duplicate_tf_translation_tolerance_m: 0.000001
+  duplicate_tf_rotation_tolerance_rad: 0.000001
+
+cache:
+  schema_version: 1
+  bag_path_template: bags/{domain_id}/{resolved_domain_sha256}/{source_bag_sha256}.h5
+  command_path_template: commands/{domain_id}/{resolved_domain_sha256}/{source_bag_sha256}.jsonl
+  manifest_path_template: manifests/{domain_id}/{resolved_domain_sha256}/manifest.jsonl
+  sample_id_template: "{source_bag_sha256}:{timestamp_ns}"
+  sensor_axis_order:
+    - front
+    - left
+    - right
+    - lidar
+  datasets:
+    camera_rgb: {dtype: uint8, shape: [N, 256, 1024, 3]}
+    lidar_count: {dtype: uint8, shape: [N, 256, 256]}
+    status: {dtype: float32, shape: [N, 8]}
+    trajectory: {dtype: float32, shape: [N, 8, 3]}
+    timestamp_ns: {dtype: int64, shape: [N]}
+    sensor_source_stamp_ns: {dtype: int64, shape: [N, 4]}
+    sensor_source_record_index: {dtype: int64, shape: [N, 4]}
+    sensor_sync_offset_ns: {dtype: int64, shape: [N, 3]}
+    ego_bracket_stamp_ns: {dtype: int64, shape: [N, 2]}
+    ego_bracket_record_index: {dtype: int64, shape: [N, 2]}
+    ego_interp_weight: {dtype: float32, shape: [N]}
+    pose_bracket_stamp_ns: {dtype: int64, shape: [N, 2]}
+    pose_bracket_record_index: {dtype: int64, shape: [N, 2]}
+    pose_interp_weight: {dtype: float32, shape: [N]}
+    future_pose_bracket_stamp_ns: {dtype: int64, shape: [N, 8, 2]}
+    future_pose_bracket_record_index: {dtype: int64, shape: [N, 8, 2]}
+    future_pose_interp_weight: {dtype: float32, shape: [N, 8]}
+  command_record_fields:
+    - domain_id
+    - resolved_domain_sha256
+    - sensor_preset_sha256
+    - source_bag_sha256
+    - command_rule_sha256
+    - timestamp_ns
+    - command_index
+    - command_name
+    - provenance
+  atomic_publication:
+    partial_suffix: .partial
+    file_fsync: true
+    replace: os.replace
+    parent_directory_fsync: true
+
+split:
+  unit: bag
+  seed_prefix: "20260806:"
+  train_fraction: 0.8
+  relative_path_separator: "/"
+  ordering:
+    - sha256_seed_prefix_plus_relative_path
+    - relative_path_utf8
+  active_bag_suffix_excluded: .bag.active
+
+validity:
+  sample_drop_reasons:
+    - DECODE_ERROR
+    - CAMERA_SYNC_MISS
+    - LIDAR_SYNC_MISS
+    - EGO_STATE_INTERPOLATION_MISS
+    - POSE_INTERPOLATION_MISS
+    - FUTURE_HORIZON_MISS
+    - NONFINITE_VALUE
+    - INVALID_COMMAND
+    - EMPTY_LIDAR
+  bag_reject_reasons:
+    - MISSING_REQUIRED_TOPIC
+    - MESSAGE_TYPE_MISMATCH
+    - FRAME_ID_MISMATCH
+    - RESOLUTION_MISMATCH
+    - EXTRINSIC_MISMATCH
+    - TF_EGO_POSE_MISMATCH
+    - DUPLICATE_STATE_CONFLICT
+    - NO_VALID_SAMPLE
