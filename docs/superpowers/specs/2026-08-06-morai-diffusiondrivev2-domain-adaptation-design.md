@@ -260,7 +260,7 @@ L_finetune = 12 × L_traj + 1e-3 × L_sp
 
 독립 학습 루프는 TransfuserAgent.compute_loss, transfuser_loss 및 TransfuserTargetBuilder를 호출하지 않는다. cache의 trajectory [B,8,3]만 supervised adapter와 LossComputer에 전달한다. agent/BEV frozen head는 forward에서 우회한다. 객체, bounding-box, BEV semantic, PDM reward 및 selector loss는 계산하지 않으며 DiffusionDriveV2 RL 경로의 XY-only loss도 사용하지 않는다.
 
-학습 루프는 AMP, gradient clipping, deterministic seed, resume, best/last checkpoint를 지원한다. validation 기준은 ADE를 우선하고 FDE와 heading MAE를 함께 기록한다.
+학습 루프는 AMP, gradient clipping, deterministic seed, resume, best/last checkpoint를 지원한다. validation 기준은 learned selector가 최종 선택한 trajectory의 sample-micro ADE를 우선하고 FDE와 heading MAE를 함께 기록한다. 추가 진단으로 같은 forward의 post-Bézier coarse top-32 후보에 대한 `minADE@32`와 `minFDE@32`를 기록하지만, 이 oracle 진단값은 checkpoint 선택에 사용하지 않는다.
 
 ### 9.3 Checkpoint export
 
@@ -289,18 +289,31 @@ Validator는 기존 `verify_runtime_assets`로 profile asset hash를 먼저 확�
 
 held-out bag cache 평가는 network를 eval mode로 두고 Validator와 동일한 PDM-free learned selector inference를 실행한다. GT-nearest `m_star` 또는 GT trajectory는 candidate 선택에 사용하지 않고, selector가 반환한 최종 `trajectory` [B,8,3]만 metric 입력으로 사용한다.
 
+학습 곡선용 oracle 진단은 배포 선택 결과를 바꾸지 않는다. validation-only context manager가 한 번의 정상 public forward 동안 `bezier_xyyaw`가 반환한 변경 전 post-Bézier proposal pool `[B,800,8,3]`과 `_select_topk`의 `topk_idx [B,32]`를 임시로 capture하고 `finally`에서 원래 callable을 복원한다. capture 유무와 관계없이 public `trajectory [B,8,3]`는 bitwise identical이어야 하며, public selected trajectory가 capture한 top-32 중 하나와 exact하게 일치해야 한다. full 800개 proposal, 4개 stage winner, GT-nearest mode는 `minADE@32`/`minFDE@32` 후보로 사용하지 않는다.
+
+sample `i`, shortlist rank `k`, horizon `t`에 대해 `ADE[i,k]=mean_t ||C[i,k,t,xy]-G[i,t,xy]||_2`, `FDE[i,k]=||C[i,k,8,xy]-G[i,8,xy]||_2`다. `minADE@32=mean_i min_k ADE[i,k]`, `minFDE@32=mean_i min_k FDE[i,k]`이며 두 metric은 독립 argmin을 사용하고 후보를 deduplicate하지 않는다. XY만 평가하고 float64로 누적한 뒤 finite JSON number로 기록한다. candidate source는 정확히 `coarse_top32_post_bezier`, `k=32`로 명시한다.
+
 확률적 diffusion sampling도 Validator와 동일하게 고정한다. `validation_run_id`는 `morai-ddv2-v1-oracle-command-validation-v1`이고 각 sample seed는 SHA-256 문자열 `diffusiondrive_v2:<timestamp_ns>:<validation_run_id>`의 앞 8 byte를 unsigned big-endian integer로 해석한다. offline과 ROS 평가는 exact parity를 위해 inference batch size 1을 사용하고 매 sample forward 직전에 Torch CPU와 모든 CUDA RNG를 해당 seed로 재설정한다. 따라서 sample 순서를 바꿔도 sample ID별 출력이 같아야 한다. 보고서에 run ID와 seed를 기록한다.
 
 다음을 계산한다.
 
 - ADE: sample별 8개 XY Euclidean error mean의 전체 sample mean
 - FDE: sample별 4.0초 XY Euclidean error의 전체 sample mean
+- minADE@32/minFDE@32: 같은 forward의 `coarse_top32_post_bezier` 후보에 대한 독립 best-of-32 XY 진단
 - heading MAE: `abs(wrap_to_pi(pred_heading-target_heading))`의 sample×time mean
 - LEFT/STRAIGHT/RIGHT/UNKNOWN별 ADE/FDE
 - 모든 결과에 `morai-ddv2-v1-oracle-command`와 `oracle-command` label
 - drop률과 sensor sync 통계
 
 best checkpoint 기준은 위 sample-micro ADE다. bag별 ADE 평균의 macro mean도 함께 기록한다. command class에 sample이 없으면 count=0과 metric=null을 기록하며 NaN을 쓰지 않는다.
+
+매 epoch validation에는 selector metric과 별도로 supervised adapter의 validation loss도 계산한다. batch size 1에서 각 sample 직전 UTF-8 `diffusiondrive_v2_supervised_loss:<timestamp_ns>:<validation_run_id>`의 SHA-256 앞 8 byte를 unsigned big-endian seed로 사용해 Torch CPU/CUDA RNG를 재설정하고, `no_grad` 아래 같은 timestep/noise sampling과 `L_finetune=12*L_traj+1e-3*L_sp`를 실행한다. train/validation의 total/trajectory/preservation loss는 sample-weighted mean이며 validation loss forward 뒤 training boundary를 exact하게 복원한다.
+
+완료된 epoch의 authoritative telemetry는 `runs/.../metrics/epochs/epoch-0000.json` 형식의 RFC 8785 canonical JSON이다. sibling `.partial`, file fsync, `os.replace`, parent-directory fsync로 원자 publish하며 schema version, epoch/global step/sample 수, config/manifest/base-checkpoint hash, train 및 validation loss 세 component, selected ADE/FDE/heading/bag-macro, `candidate_source=coarse_top32_post_bezier`, `k=32`, `min_ade`, `min_fde`, validation report SHA-256와 best-checkpoint 상태를 기록한다. wall-clock field와 NaN/Infinity는 금지한다.
+
+`last.pt`는 mid-epoch resume 시 곡선 누락을 막기 위해 현재 epoch의 completed batch/sample 수, 세 loss의 sample-weighted numerator와 grad-norm step sum/count를 가진 `EpochAccumulatorState`를 저장한다. epoch JSON을 먼저 durable publish한 뒤 sampler를 다음 epoch로 advance하고 해당 epoch-record hash를 포함한 `last.pt`를 durable publish한다. resume 시 기존 epoch JSON bytes가 같으면 idempotent하게 받아들이고 다르면 실패한다. next-epoch checkpoint가 가리키는 epoch JSON이 없으면 실패하며, epoch-end cursor와 기존 JSON이 있고 checkpoint가 아직 advance되지 않은 crash 상태는 검증 후 finish/publish를 재개한다.
+
+`metrics/history.jsonl`, `metrics/epoch_metrics.csv`, `plots/training-curves.png`는 authoritative epoch JSON들을 epoch 번호순으로 다시 읽어 매번 atomic rebuild하는 파생물이다. CSV는 epoch, global step, train/validation total·trajectory·preservation loss, selected ADE/FDE/heading, minADE@32/minFDE@32와 best flag를 가진다. PNG는 (1) train/validation total loss, (2) selected ADE/FDE, (3) minADE@32/minFDE@32의 세 panel을 가진다. history에 blind append하지 않고 plot을 resume state로 사용하지 않는다.
 
 ### 10.2 ROS Validator
 
