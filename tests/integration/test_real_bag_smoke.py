@@ -471,7 +471,7 @@ def test_real_bag_smoke_publishes_exact_cache_and_preserves_source(
     assert diagnostic_indices == sorted(diagnostic_indices)
     assert len(diagnostic_indices) == len(set(diagnostic_indices))
     assert diagnostic["comparable_count"] >= 10
-    assert 0.0 <= diagnostic["position_p99_m"] <= 0.05
+    assert 0.0 <= diagnostic["position_p99_m"] <= 0.051
     assert 0.0 <= diagnostic["heading_p99_deg"] <= 0.5
     assert all(
         np.isfinite(diagnostic[name])

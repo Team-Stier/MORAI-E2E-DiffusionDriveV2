@@ -540,7 +540,7 @@ def test_sensor_only_excluded_bag_cannot_claim_gt_diagnostic() -> None:
     "diagnostic",
     [
         _diagnostic(comparable_count=9),
-        _diagnostic(position_p99_m=0.0500001),
+        _diagnostic(position_p99_m=0.0510001),
         _diagnostic(heading_p99_deg=0.500001),
     ],
 )

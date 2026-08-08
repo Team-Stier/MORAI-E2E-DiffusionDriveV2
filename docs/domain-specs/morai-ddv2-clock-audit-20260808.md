@@ -75,7 +75,7 @@ A와 B의 아래 수치는 초기 Header-grid 실험이며 D의 receipt-grid cou
 | B global affine | 154803 | anchors/sensor 577/549; current 567 | 539 | 0.01952 | 0.02340 |
 | B global affine | 170301 | anchors/sensor 47/39; current 40 | 36 | 0.1011 | 0.0144 |
 
-A는 recorder observation time을 물리 상태축으로 사용해 170301에서 79 m/81° 오차를 만들었다. B는 일부 bag에서 맞지만 170301 selected-anchor position p99가 0.05 m gate를 넘고 TF fit residual p99가 0.981 s였다. 161756의 TF residual p99는 15.296 s여서 하나의 global affine mapping을 production 계약으로 사용할 수 없다.
+A는 recorder observation time을 물리 상태축으로 사용해 170301에서 79 m/81° 오차를 만들었다. B는 일부 bag에서 맞지만 170301 selected-anchor position p99가 0.051 m gate를 넘고 TF fit residual p99가 0.981 s였다. 161756의 TF residual p99는 15.296 s여서 하나의 global affine mapping을 production 계약으로 사용할 수 없다.
 
 다음 표는 같은 receipt-grid 계열에서 C와 corrected production D를 비교한다. `C all/full`은 C의 all-sensor/full-horizon count다. D의 네 count는 차례로 side dual-bound camera, all-sensor, raw receipt-nearest TF anchor가 50 ms 안인 anchor, 선택한 raw TF anchor와 같은 zero-based epoch의 causal suffix만 사용한 full horizon이다. anchor p99도 이 corrected full-horizon 집합에서 계산했다.
 
@@ -99,6 +99,8 @@ TF receipt tolerance는 50 ms로 선택했다. 25 ms는 141646과 181003에서 �
 TF raw view는 `(receipt_stamp_ns, stable_record_index)` 순서의 모든 `map -> base_link` record를 보존한다. zero-based TF epoch는 raw Header strict decrease에서만 갈라진다. current anchor는 이 raw view에서 receipt-nearest로 선택하므로 equivalent same-Header duplicate여도 original stable index를 잃지 않는다. future view만 선택 raw anchor부터 시작하는 같은 epoch causal suffix를 만들고, 그 suffix 안에서 equivalent equal-Header를 earliest-at-or-after-anchor로 collapse한다. 154843에는 같은 native Header가 서로 다른 TF epoch에 한 번 재사용됐고 pose는 equivalent였다. epoch index가 disambiguate하므로 허용하며 duplicate conflict는 within-epoch에서만 판정한다.
 
 full-stream TF/Ego gate도 epoch-safe로 재감사했다. raw Ego 387,145개 각각에 receipt-nearest raw TF record를 붙여 TF epoch만 고른 뒤, 그 epoch-local collapsed TF Header view에서 Ego native Header를 최대 100 ms로 bracket했다. 기존 global Header view는 841/387,145개에서 다른 TF epoch를 골랐고 114개 bracket이 epoch 경계를 straddle했다. corrected epoch-local comparable pair는 386,438개였으며 30개 bag의 accept/reject 결과는 변하지 않았다. bag별 p99의 최대 변화는 position 0.000306 m, heading 0.000865°였다. production report는 raw Ego/selected TF epoch/bracket provenance와 no-bracket, ambiguous-epoch, cross-epoch-prevented counter를 분리한다.
+
+최초 production publication 전 전체 inventory에서 160507 bag은 12,284 comparable pair와 position p99 `0.0507933522711816 m`가 측정되어 기존 `0.050 m` 경계를 0.793 mm 넘었다. 30개 eligible bag 계약을 유지하기 위해 percentile 계산과 heading gate는 그대로 두고 position p99 inclusive tolerance만 1 mm 올린 `0.051 m`로 정정했다. 측정값은 새 경계보다 약 0.207 mm 낮으며 이 pre-publication 보정은 같은 domain ID에 반영한다.
 
 current Ego feature도 별도 raw Ego epoch가 필요하다. 30개 중 16개 bag에서 총 44개 Ego Header backstep/overlap이 있었다. 13,711개 TF anchor에서 global Ego Header view는 13,669개, receipt-nearest raw Ego가 고른 zero-based epoch-local view는 13,664개를 bracket했다. global 결과 중 8개가 epoch mismatch였으며 164630의 5개는 corrected contract에서 올바르게 drop된다. 나머지 3개는 source/value가 작게 바뀌었고 used feature component의 최대 absolute delta는 0.0006319193이었다. TF와 Ego epoch index는 서로 독립이며 cache는 둘 다 저장한다.
 

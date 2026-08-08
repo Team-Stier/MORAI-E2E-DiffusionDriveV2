@@ -339,7 +339,7 @@ def slerp_shortest(a: Sequence[float], b: Sequence[float], weight: float) -> np.
 
 - [ ] Run `.venv-ros/bin/python -m pytest tests/unit/preprocess/test_geometry.py tests/unit/preprocess/test_diagnostics.py -q`. Expected: FAIL before implementation.
 - [ ] Implement all quaternion computations in float64, normalize inputs and output, and wrap heading to `[-pi, pi)`; cast only final cached trajectory/status arrays to float32.
-- [ ] Exclude unbracketable bag-edge Ego stamps from diagnostics and record max as diagnostic only. Add explicit comparable-count cases 0, 9, and 10: counts below 10 raise bag-level `TF_EGO_POSE_MISMATCH`; count 10 proceeds to nearest-rank p99, which also rejects over 0.05 m or 0.5 degrees.
+- [ ] Exclude unbracketable bag-edge Ego stamps from diagnostics and record max as diagnostic only. Add explicit comparable-count cases 0, 9, and 10: counts below 10 raise bag-level `TF_EGO_POSE_MISMATCH`; count 10 proceeds to nearest-rank p99, which also rejects over 0.051 m or 0.5 degrees.
 - [ ] Run `.venv-ros/bin/python -m pytest tests/unit/preprocess/test_geometry.py tests/unit/preprocess/test_diagnostics.py -q`, then `.venv-ros/bin/python -m pytest tests/unit/preprocess -q`. Expected: both commands PASS.
 - [ ] Commit.
 

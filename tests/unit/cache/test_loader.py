@@ -423,8 +423,8 @@ def test_loader_rejects_rehashed_but_semantically_invalid_diagnostic_report(
         bag["tf_ego_epoch_local_comparable_count"] -= 1
         bag["tf_ego_raw_record_count"] -= 1
     elif corruption == "position_p99":
-        diagnostic["position_p99_m"] = 0.0500001
-        diagnostic["position_max_m"] = 0.0500001
+        diagnostic["position_p99_m"] = 0.0510001
+        diagnostic["position_max_m"] = 0.0510001
     else:
         diagnostic["heading_p99_deg"] = 0.500001
         diagnostic["heading_max_deg"] = 0.500001

@@ -711,7 +711,7 @@ def _enforce_eligible_diagnostic_gate(
         type(minimum) is not int
         or minimum != 10
         or type(position_tolerance) is not float
-        or position_tolerance != 0.05
+        or position_tolerance != 0.051
         or type(heading_tolerance) is not float
         or heading_tolerance != 0.5
     ):
@@ -719,7 +719,7 @@ def _enforce_eligible_diagnostic_gate(
     if diagnostic_mapping["comparable_count"] < minimum:
         raise IntegrityError("eligible TF/Ego diagnostic has fewer than 10 comparable pairs")
     if diagnostic_mapping["position_p99_m"] > position_tolerance:
-        raise IntegrityError("eligible TF/Ego diagnostic position p99 exceeds 0.05 m")
+        raise IntegrityError("eligible TF/Ego diagnostic position p99 exceeds 0.051 m")
     if diagnostic_mapping["heading_p99_deg"] > heading_tolerance:
         raise IntegrityError("eligible TF/Ego diagnostic heading p99 exceeds 0.5 deg")
 

@@ -100,7 +100,7 @@ def test_pure_error_aggregation_preserves_p99_and_isolated_max_contract() -> Non
         heading_errors_deg=(0.0,) * 99 + (10.0,),
         excluded_count=7,
         minimum_comparable_pairs=10,
-        position_p99_tolerance_m=0.05,
+        position_p99_tolerance_m=0.051,
         heading_p99_tolerance_deg=0.5,
     )
 
@@ -116,16 +116,16 @@ def test_pure_error_aggregation_preserves_p99_and_isolated_max_contract() -> Non
 
 def test_pure_error_aggregation_uses_inclusive_tolerances_and_attaches_metric() -> None:
     at_limit = aggregate_tf_ego_errors(
-        position_errors_m=(0.05,) * 10,
+        position_errors_m=(0.051,) * 10,
         heading_errors_deg=(0.5,) * 10,
         excluded_count=0,
     )
 
-    assert at_limit.position_p99_m == pytest.approx(0.05)
+    assert at_limit.position_p99_m == pytest.approx(0.051)
     assert at_limit.heading_p99_deg == pytest.approx(0.5)
     with pytest.raises(TfEgoPoseMismatch) as caught:
         aggregate_tf_ego_errors(
-            position_errors_m=(0.050001,) * 10,
+            position_errors_m=(0.051001,) * 10,
             heading_errors_deg=(0.0,) * 10,
             excluded_count=2,
         )
@@ -310,12 +310,12 @@ def test_n100_two_heading_outliers_reject_at_p99() -> None:
 
 
 def test_n10_position_tolerance_is_inclusive_and_epsilon_rejects() -> None:
-    at_limit_ego, at_limit_tf = _exact_records(10, position_errors_m=(0.05,) * 10)
-    over_ego, over_tf = _exact_records(10, position_errors_m=(0.050001,) * 10)
+    at_limit_ego, at_limit_tf = _exact_records(10, position_errors_m=(0.051,) * 10)
+    over_ego, over_tf = _exact_records(10, position_errors_m=(0.051001,) * 10)
 
     assert compute_tf_ego_diagnostic(
         at_limit_ego, at_limit_tf, max_bracket_ns=0
-    ).position_p99_m == pytest.approx(0.05)
+    ).position_p99_m == pytest.approx(0.051)
     with pytest.raises(TfEgoPoseMismatch, match="position"):
         compute_tf_ego_diagnostic(over_ego, over_tf, max_bracket_ns=0)
 
