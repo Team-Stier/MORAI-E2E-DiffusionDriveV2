@@ -206,22 +206,18 @@ def _record_identity(record: CommandRecord) -> CommandSidecarIdentity:
     )
 
 
-def read_command_sidecar(
-    path: Path,
+def read_command_sidecar_bytes(
+    payload: bytes,
     expected_identity: CommandSidecarIdentity,
 ) -> Mapping[int, CommandRecord]:
-    if not isinstance(path, Path):
-        raise TypeError("path must be a pathlib.Path")
+    if type(payload) is not bytes:
+        raise TypeError("payload must be bytes")
     if type(expected_identity) is not CommandSidecarIdentity:
         raise TypeError("expected_identity must be a CommandSidecarIdentity")
     try:
         expected_identity = CommandSidecarIdentity(**expected_identity.__dict__)
     except (TypeError, ValueError) as error:
         raise IntegrityError("invalid expected sidecar identity") from error
-    try:
-        payload = path.read_bytes()
-    except OSError as error:
-        raise IntegrityError("command sidecar is not readable: {}".format(path)) from error
     if not payload or not payload.endswith(b"\n"):
         raise IntegrityError("command sidecar must be nonempty and end with newline")
 
@@ -263,3 +259,16 @@ def read_command_sidecar(
         previous_timestamp = record.timestamp_ns
         records[record.timestamp_ns] = record
     return MappingProxyType(records)
+
+
+def read_command_sidecar(
+    path: Path,
+    expected_identity: CommandSidecarIdentity,
+) -> Mapping[int, CommandRecord]:
+    if not isinstance(path, Path):
+        raise TypeError("path must be a pathlib.Path")
+    try:
+        payload = path.read_bytes()
+    except OSError as error:
+        raise IntegrityError("command sidecar is not readable: {}".format(path)) from error
+    return read_command_sidecar_bytes(payload, expected_identity)
