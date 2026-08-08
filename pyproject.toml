@@ -14,3 +14,11 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: requires a working CUDA-capable GPU and driver",
+    "realbag: requires local production ROS bag data",
+    "upstream: requires pinned upstream source checkouts and model assets",
+]
