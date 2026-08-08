@@ -7,7 +7,6 @@ import gc
 import os
 import sys
 import weakref
-from dataclasses import FrozenInstanceError
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,7 +16,7 @@ import pytest
 
 from morai_ddv2.config.models import ResolvedDomain
 from morai_ddv2.errors import ConfigurationError, IntegrityError
-from morai_ddv2.preprocess.diagnostics import EgoDiagnosticValue, TfEgoPoseMismatch
+from morai_ddv2.preprocess.diagnostics import EgoDiagnosticValue
 from morai_ddv2.preprocess.geometry import Pose
 from morai_ddv2.ros1 import bag_reader
 from morai_ddv2.ros1.bag_reader import (
