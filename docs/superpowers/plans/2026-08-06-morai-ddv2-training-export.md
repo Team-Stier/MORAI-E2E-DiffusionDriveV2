@@ -20,7 +20,11 @@
 - Do not wrap frozen downstream modules in `torch.no_grad()`: gradients must flow through their operations back into the trainable backbone/fusion parameters.
 - Never call global `model.train()` after configuring the freeze boundary. Reapply the exact mode boundary at every epoch.
 - Best-checkpoint selection remains strictly lower selected sample-micro ADE. `minADE@32` and `minFDE@32` are diagnostic-only metrics over the exact `coarse_top32_post_bezier` shortlist captured from the same public forward; they never select a checkpoint or a deployment trajectory.
-- Every completed epoch has one atomic canonical JSON source of truth. JSONL/CSV/PNG curves are rebuilt derived artifacts, never append-only resume state.
+- Every completed epoch has one atomic RFC 8785 aggregate JSON source of truth. It binds the separately published full validation report by SHA-256 but does not embed per-sample nanosecond timestamps or records. Full validation reports use deterministic strict stdlib JSON because ROS nanosecond integers exceed the RFC 8785/I-JSON safe-integer range. JSONL/CSV/PNG curves are rebuilt derived artifacts, never append-only resume state.
+- A verified preprocessing `source_code_commit` is immutable provenance and must resolve to a commit object, but it is not required to equal the later clean training checkout HEAD. Training artifacts record both identities instead of rewriting or rejecting the earlier cache provenance.
+- Exact resume means identical committed sample order, sampler cursor, RNG/checkpoint state, and CPU-fake reference behavior. The pinned CUDA graph contains `grid_sample` backward operations without a deterministic implementation under this stack, so real-GPU continuity is checked numerically and is never advertised as bitwise tensor identity.
+- Any invocation with a `--max-*` bound is a debug/smoke run. Its exact allowed outputs are `debug/resolved-run-config.json`, `debug/last.pt`, optional `debug/best.pt`, `debug/validation.json`, and `debug/smoke-summary.json`; it never publishes authoritative completed-epoch telemetry, production history/CSV/PNG, root checkpoints, or `run-complete.json`.
+- Run the training environment offline (`HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`) after the pinned local assets have been verified; no training or validation path may fetch code or weights at runtime.
 - The raw 972-key checkpoint, including `_trajectory_head.vocab`, is immutable except for allowlisted parameter/BatchNorm entries. Metadata is external and never inserted into the checkpoint state dict.
 - Generated runs and checkpoints live under ignored `runs/` and `artifacts/`. The machine-specific profile is generated only at `configs/validator/profile-morai-ddv2-oracle.json`, is ignored by the tracked `configs/validator/.gitignore`, and is never committed because it contains absolute paths and hashes that exist only after export. Commits contain code, static training config, the profile ignore rule, and tests only.
 
@@ -188,6 +192,7 @@ def normalize_sel_runtime_state(raw):
 
 ```bash
 .venv-train/bin/python -m pytest tests/unit/training/test_sel_loader.py -q
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
 MORAI_DDV2_VALIDATOR_ROOT="$PWD/third_party/E2E-OpenLoop-ROS-Validator" \
 MORAI_DDV2_SEL_CHECKPOINT="$PWD/third_party/E2E-OpenLoop-ROS-Validator/models/diffusiondrive_v2/navsim_v2/diffusiondrivev2_sel.ckpt" \
 .venv-train/bin/python -m pytest tests/integration/test_pinned_sel_loader.py -m upstream -q
@@ -321,6 +326,7 @@ def build_shared_trajectory_context(model, features):
 
 ```bash
 .venv-train/bin/python -m pytest tests/unit/training/test_supervised_context.py -q
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
 MORAI_DDV2_VALIDATOR_ROOT="$PWD/third_party/E2E-OpenLoop-ROS-Validator" \
   .venv-train/bin/python -m pytest tests/integration/test_pinned_sel_context.py -m upstream -q
 ```
@@ -391,7 +397,8 @@ def sample_noisy_plan_anchors(head, batch_size, device):
 
 ```bash
 .venv-train/bin/python -m pytest tests/unit/training/test_noisy_anchors.py tests/unit/training/test_supervised_adapter.py -q
-CUDA_VISIBLE_DEVICES=0 MORAI_DDV2_VALIDATOR_ROOT="$PWD/third_party/E2E-OpenLoop-ROS-Validator" \
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 \
+MORAI_DDV2_VALIDATOR_ROOT="$PWD/third_party/E2E-OpenLoop-ROS-Validator" \
 .venv-train/bin/python -m pytest tests/integration/test_pinned_sel_adapter.py -m upstream -q
 ```
 
@@ -426,7 +433,7 @@ def compose_finetune_loss(trajectory_loss: torch.Tensor, model: nn.Module, refer
 def assert_loss_contract(head: nn.Module, *, trajectory_weight: float, preservation_weight: float) -> None
 ```
 
-- [ ] Use hand-calculated tensors to prove `L_sp` is total squared-error sum divided by total allowlisted scalar count, not the mean of per-tensor means. Verify reference tensors are detached FP32 CPU/GPU-compatible clones not registered in model state.
+- [ ] Use hand-calculated tensors to prove `L_sp` is total squared-error sum divided by total allowlisted scalar count, not the mean of per-tensor means. Verify reference tensors are detached FP32 clones on the model device and are not registered in model state; do not copy the full reference allowlist from CPU on every step.
 - [ ] Assert upstream `LossComputer` has exact scalar fields `cls_loss_weight == 10.0` and `reg_loss_weight == 8.0`, so it yields `L_traj = 10*L_cls + 8*L_reg`; `assert_loss_contract` also requires outer weights `trajectory_weight == 12.0` and `preservation_weight == 1e-3` before any forward/backward. Test each of the four weight mutations fails, and test that the valid composite is exactly `12*L_traj + 1e-3*L_sp`. Test raw heading scalar L1 across the ±π boundary; no circular correction belongs in training loss.
 
 ```python
@@ -568,7 +575,7 @@ class StatefulPermutationSampler(torch.utils.data.Sampler[int]):
 
 - [ ] Test a prefetched mid-epoch stop: request more indices from `iter(sampler)` than the trainer marks consumed, serialize state, restore into a fresh sampler, and assert iteration restarts at the first uncommitted index. Also assert an uninterrupted two-epoch index stream is exactly equal to a save/restore stream.
 - [ ] Run `.venv-train/bin/python -m pytest tests/unit/training/test_dataset.py tests/unit/training/test_sampler.py tests/unit/training/test_training_config.py -q`. Expected: FAIL.
-- [ ] Use the stateful sampler instead of `shuffle=True`; pass a separate seeded CPU `torch.Generator` to DataLoader for worker base seeds, and seed Python/NumPy from `torch.initial_seed()` in worker init. Dataset `__getitem__` remains deterministic and performs no worker-local random augmentation. Validation never shuffles and always uses B=1.
+- [ ] Use the stateful sampler instead of `shuffle=True`; pass a separate seeded CPU `torch.Generator` to DataLoader for worker base seeds, and seed Python/NumPy from `torch.initial_seed()` in worker init. Dataset `__getitem__` remains deterministic and performs no worker-local random augmentation. Open HDF5 files lazily per worker/process, never retain an h5py handle across fork/pickle, and close worker-local handles deterministically. Validation never shuffles and always uses B=1.
 - [ ] Run `.venv-train/bin/python -m pytest tests/unit/training/test_dataset.py tests/unit/training/test_sampler.py tests/unit/training/test_training_config.py -q`. Expected: PASS.
 - [ ] Commit.
 
@@ -599,6 +606,7 @@ class RngState:
     torch_cpu: torch.Tensor
     torch_cuda: tuple[torch.Tensor, ...]
     dataloader_cpu: torch.Tensor
+    dataloader_iterator_base_cpu: torch.Tensor
 
 @dataclass(frozen=True)
 class ResumeState:
@@ -608,6 +616,7 @@ class ResumeState:
     sampler: SamplerState
     accumulator: EpochAccumulatorState
     completed_epoch_record_sha256: str | None
+    rng: RngState
 
 @dataclass(frozen=True)
 class EpochAccumulatorState:
@@ -626,9 +635,10 @@ class StepMetrics:
     trajectory_loss: float
     preservation_loss: float
     grad_norm: float
+    optimizer_step_applied: bool
 
     @classmethod
-    def from_tensors(cls, loss: FinetuneLoss, grad_norm: torch.Tensor) -> StepMetrics
+    def from_tensors(cls, loss: FinetuneLoss, grad_norm: torch.Tensor, *, optimizer_step_applied: bool) -> StepMetrics
 
 @dataclass(frozen=True)
 class EpochMetrics:
@@ -640,20 +650,24 @@ class EpochMetrics:
     mean_trajectory_loss: float
     mean_preservation_loss: float
 
-def capture_rng_state(dataloader_generator: torch.Generator) -> RngState
+def capture_rng_state(dataloader_generator: torch.Generator, *, dataloader_iterator_base_cpu: torch.Tensor) -> RngState
 def restore_rng_state(state: RngState, dataloader_generator: torch.Generator) -> None
+def create_dataloader_iterator(dataloader: DataLoader, dataloader_generator: torch.Generator, *, iterator_base_state: torch.Tensor | None = None, current_generator_state: torch.Tensor | None = None) -> tuple[Iterator[Any], torch.Tensor]
+def snapshot_batchnorm_buffers(model: nn.Module, manifest: FreezeManifest) -> Mapping[str, torch.Tensor]
+def restore_batchnorm_buffers(model: nn.Module, snapshot: Mapping[str, torch.Tensor], manifest: FreezeManifest) -> None
 def save_training_checkpoint(path: Path, *, mutable_state, optimizer, scaler, epoch: int, global_step: int, best_micro_ade: float, rng: RngState, sampler_state: SamplerState, accumulator: EpochAccumulatorState, completed_epoch_record_sha256: str | None, base_checkpoint_sha256: str, manifest: FreezeManifest, config: Mapping[str, Any]) -> None
-def load_training_checkpoint(path: Path, *, model, optimizer, scaler, sampler: StatefulPermutationSampler, dataloader_generator: torch.Generator, manifest: FreezeManifest, expected_base_checkpoint_sha256: str) -> ResumeState
+def load_training_checkpoint(path: Path, *, model, optimizer, scaler, sampler: StatefulPermutationSampler, manifest: FreezeManifest, expected_base_checkpoint_sha256: str) -> ResumeState
 def train_step(model, batch, optimizer, scaler, reference, manifest, *, amp: bool, grad_clip_norm: float, trajectory_weight: float, preservation_weight: float) -> StepMetrics
 def train_one_epoch(*, model: nn.Module, dataloader: DataLoader, sampler: StatefulPermutationSampler, optimizer: torch.optim.Optimizer, scaler: torch.cuda.amp.GradScaler, reference: Mapping[str, torch.Tensor], manifest: FreezeManifest, amp: bool, grad_clip_norm: float, trajectory_weight: float, preservation_weight: float, epoch: int, global_step: int, accumulator: EpochAccumulatorState) -> EpochMetrics
 ```
 
-- [ ] Test capture/restore for Python, NumPy, Torch CPU, every CUDA generator, and the DataLoader CPU generator. Test resume equivalence at a **mid-epoch committed batch boundary** with worker prefetch: uninterrupted steps and sample IDs must exactly equal step→`sampler.mark_consumed(batch_size)`→accumulator update→save→fresh base load→mutable/optimizer/scaler/sampler/all-RNG/accumulator restore→remaining steps. Assert both executions finish with identical model tensors, optimizer/scaler state, sample-weighted loss numerators/means, grad-norm sum/count, sample order, epoch, and global step.
-- [ ] Test operation order: zero grad; autocast adapter; FP32 preservation/composite; scaled backward; unscale; clip only allowlisted parameters; optimizer/scaler step. Frozen parameters remain byte-identical and allowed BN buffers may change.
+- [ ] Test capture/restore for Python, NumPy, Torch CPU, every CUDA generator, the DataLoader CPU generator, and the saved state from immediately before the current epoch iterator was created. `create_dataloader_iterator` records and returns the base state before a fresh `iter(dataloader)`. On resume/retry it sets the generator to `iterator_base_state`, constructs the replacement iterator so workers receive the original base seed, then restores `current_generator_state`; iterator reconstruction therefore consumes no extra persistent RNG draw. `capture_rng_state` receives the trainer-held base state explicitly, `load_training_checkpoint` returns the saved `RngState` without constructing an iterator, and the trainer calls `restore_rng_state` then `create_dataloader_iterator(..., iterator_base_state=resume.rng.dataloader_iterator_base_cpu, current_generator_state=resume.rng.dataloader_cpu)`. Test resume equivalence at a **mid-epoch committed batch boundary** with worker prefetch: uninterrupted steps and sample IDs must exactly equal step→`sampler.mark_consumed(batch_size)`→accumulator update→save→fresh base load→mutable/optimizer/scaler/sampler/all-RNG/accumulator restore→remaining steps. Require exact model/optimizer/scaler equivalence for the deterministic CPU fake and exact sampler/RNG/sample-order/epoch/global-step restoration plus finite tolerance-checked continuity on the real CUDA graph.
+- [ ] Test operation order: zero grad; snapshot allowlisted BatchNorm buffers; autocast adapter; FP32 preservation/composite; scaled backward; unscale; clip only allowlisted parameters; optimizer/scaler step. Compare `scaler.get_scale()` before and after `scaler.update()` and set `optimizer_step_applied = new_scale >= old_scale` (`GradScaler(enabled=False)` remains applied). On overflow, restore the pre-forward BatchNorm buffers, return `optimizer_step_applied=False`, do not advance sampler/accumulator/global step or publish a step checkpoint, and recreate the iterator from the first uncommitted sample with the same held iterator-base plus current DataLoader-generator states. Frozen parameters remain byte-identical and allowed BN buffers may change only on applied steps.
 
 ```python
 def train_step(model, batch, optimizer, scaler, reference, manifest, *, amp, grad_clip_norm, trajectory_weight, preservation_weight):
     optimizer.zero_grad(set_to_none=True)
+    bn_before = snapshot_batchnorm_buffers(model, manifest)
     with torch.cuda.amp.autocast(enabled=amp):
         result = forward_trajectory_supervised(model, batch["features"], batch["trajectory"])
     loss = compose_finetune_loss(
@@ -665,14 +679,18 @@ def train_step(model, batch, optimizer, scaler, reference, manifest, *, amp, gra
     scaler.unscale_(optimizer)
     parameters = [dict(model.named_parameters())[name] for name in manifest.trainable_parameters]
     grad_norm = torch.nn.utils.clip_grad_norm_(parameters, grad_clip_norm)
+    scale_before = scaler.get_scale()
     scaler.step(optimizer)
     scaler.update()
     assert_training_boundary(model, manifest)
-    return StepMetrics.from_tensors(loss, grad_norm)
+    applied = scaler.get_scale() >= scale_before
+    if not applied:
+        restore_batchnorm_buffers(model, bn_before, manifest)
+    return StepMetrics.from_tensors(loss, grad_norm, optimizer_step_applied=applied)
 ```
 
 - [ ] Run `.venv-train/bin/python -m pytest tests/unit/training/test_rng_checkpoint.py tests/unit/training/test_train_step.py tests/unit/training/test_resume.py -q`. Expected: FAIL.
-- [ ] Save training checkpoints separately from deployment checkpoints. They contain only mutable normalized state plus optimizer/scaler/current epoch/global step/best/config/freeze, `SamplerState`, `EpochAccumulatorState`, optional `completed_epoch_record_sha256`, and every `RngState` field. Load order is base 971 strict load→boundary/reference snapshot→mutable state→optimizer/scaler→sampler→accumulator→global and DataLoader RNG. Restore all state before creating the resumed DataLoader iterator. Reject accumulator epoch/counts that disagree with sampler epoch/committed cursor.
+- [ ] Save training checkpoints separately from deployment checkpoints. They contain only mutable normalized state plus optimizer/scaler/current epoch/global step/best/config/freeze, `SamplerState`, `EpochAccumulatorState`, optional `completed_epoch_record_sha256`, and every `RngState` field. Load order is base 971 strict load→boundary/reference snapshot→mutable state→optimizer/scaler→sampler→accumulator; return `ResumeState.rng`; then the trainer restores global/current RNG, recreates the DataLoader iterator from the saved base state, and restores the saved current DataLoader-generator state. Reject accumulator epoch/counts that disagree with sampler epoch/committed cursor.
 - [ ] After each successful optimizer/scaler step, call `sampler.mark_consumed(actual_batch_size)`, update the accumulator with `metric * actual_batch_size` numerators, increment global step, and atomically publish `last.pt` whenever `global_step % checkpoint_interval_steps == 0`. Do not clear the accumulator or call `sampler.finish_epoch()` until Task 10 has durably published that epoch's canonical telemetry JSON. `best.pt` is written only after Task 9 validation and only on strictly lower selected sample-micro ADE.
 - [ ] Run `.venv-train/bin/python -m pytest tests/unit/training/test_rng_checkpoint.py tests/unit/training/test_train_step.py tests/unit/training/test_resume.py -q`. Expected: PASS, including exact mid-epoch sample-order and state equivalence.
 - [ ] Commit.
@@ -770,7 +788,7 @@ def reset_torch_seed(seed: int) -> None:
 - [ ] Run `.venv-train/bin/python -m pytest tests/unit/training/test_metrics.py tests/unit/training/test_validation.py -q`. Expected: FAIL.
 - [ ] Set the network eval while validating, use the same PDM-free learned selector public derivative used by Validator, B=1 only, and final returned `trajectory`. Capture the exact post-Bézier coarse top-32 from that same forward only for diagnostic `minADE@32`/`minFDE@32`. Never use GT-nearest `m_star`, GT trajectory, decoder logits, the full 800 proposal pool, or the four stage winners to select a candidate or compute the named @32 metrics.
 - [ ] Keep metric aggregation, heading reconstruction, wrapping, and seed derivation NumPy/stdlib-only in `training/metrics.py`; import Torch locally only inside `reset_torch_seed` or in `validation.py`. This lets the ROS report path reuse exact metrics without importing Torch.
-- [ ] Restore the exact training boundary after selector and loss validation. Write reports with domain/oracle labels, run ID, per-sample seed, selected metrics, candidate source/count, per-sample min/ranks, aggregate minADE@32/minFDE@32, counts, drop statistics, separate side-Header/sensor-receipt/raw-TF-anchor-receipt/TF-epoch/Ego-epoch statistics, bound epoch-safe TF/Ego diagnostic counters/report hashes, 28-dataset cache-schema identity and 24 repeated manifest provenance values, and no non-JSON floats. Sort serialized `records` by `sample_id` and omit traversal order and wall-clock generation time so manifest-order and reverse-order runs with identical per-sample outputs produce byte-identical canonical reports.
+- [ ] Restore the exact training boundary after selector and loss validation. Write reports with domain/oracle labels, run ID, per-sample seed, selected metrics, candidate source/count, per-sample min/ranks, aggregate minADE@32/minFDE@32, counts, drop statistics, separate side-Header/sensor-receipt/raw-TF-anchor-receipt/TF-epoch/Ego-epoch statistics, bound epoch-safe TF/Ego diagnostic counters/report hashes, 28-dataset cache-schema identity and 24 repeated manifest provenance values, and no non-JSON floats. Sort serialized `records` by `sample_id` and omit traversal order and wall-clock generation time so manifest-order and reverse-order runs with identical per-sample outputs produce byte-identical deterministic strict-JSON reports. Use `json.dumps(..., sort_keys=True, ensure_ascii=False, allow_nan=False, separators=(",", ":"))`; do not pass nanosecond-bearing reports to RFC 8785.
 - [ ] Run `.venv-train/bin/python -m pytest tests/unit/training/test_metrics.py tests/unit/training/test_validation.py -q`. Expected: PASS.
 - [ ] Commit.
 
@@ -827,7 +845,7 @@ class EpochTelemetry:
     global_step: int
     train: EpochMetrics
     validation_loss: ValidationLossSummary
-    validation: ValidationReport
+    validation: Mapping[str, Any]  # finite aggregate projection; no sample records/ns
     validation_report_sha256: str
     identities: Mapping[str, str]
     best_epoch: int
@@ -840,17 +858,17 @@ def rebuild_training_artifacts(run_dir: Path) -> TrainingArtifactHashes
 def publish_production_run_attestation(run_dir: Path, attestation: ProductionRunAttestation) -> Path
 ```
 
-- [ ] Test CLI preflight failures before model construction: schema other than 2, a 27-field or otherwise incomplete schema 2, wrong corrected Option D resolved-domain/domain/preset/manifest hash, non-increasing/duplicate front identity, missing raw TF or Ego epoch provenance, mismatched diagnostic report/counters, mixed-axis provenance, dirty cache, wrong source commit, missing assets, wrong Python/Torch, unavailable CUDA for an actual training invocation, zero/negative values for each `--max-*` smoke bound, and any offline `--sample-order` other than `manifest` or `reverse`. Test that omitted bounds preserve the YAML values, supplied positive bounds are recorded in the resolved run config and limit only that invocation, and reverse order changes traversal only while canonical report rows remain sample-ID sorted.
-- [ ] Test a two-epoch fake-model fit: training boundary reapplied each epoch, selector and supervised-loss validation B=1, `last.pt` every epoch, `best.pt` only on strictly lower selected micro ADE, selected FDE/heading/macro plus minADE@32/minFDE@32 logged, and resume continues epoch/global step/RNG/accumulator exactly. Test crash reconciliation at (a) mid-epoch, (b) durable epoch JSON before sampler-finished `last.pt`, and (c) next-epoch `last.pt` with missing/mismatched epoch JSON, which must fail. Atomically publish `run-complete.json` only after all configured epochs finish with all three smoke bounds absent; it binds config/manifest/base/best hashes, epoch count, history/CSV/PNG hashes. Interrupted and bounded smoke/debug runs must not have this attestation.
-- [ ] Write telemetry tests first. One authoritative file per completed epoch is `metrics/epochs/epoch-{epoch:04d}.json`, RFC 8785 canonical bytes, published by sibling `.partial`/file-fsync/replace/parent-fsync with no wall-clock or nonfinite value. Existing exact bytes are idempotent; conflicting bytes fail. From sorted epoch files, atomically rebuild `metrics/history.jsonl`, `metrics/epoch_metrics.csv`, and `plots/training-curves.png` rather than appending. CSV columns are epoch/global_step, train and validation total/trajectory/preservation loss, selected ADE/FDE/heading, minADE@32/minFDE@32, and best flag. PNG has exactly three labeled panels: train/validation total loss; selected ADE/FDE; minADE@32/minFDE@32. A generated plot is never resume state.
-- [ ] Implement `fit` with constant recommended AdamW learning rate from config; do not add an unapproved scheduler. Before constructing the optimizer, call `assert_loss_contract` against the loaded upstream head and resolved outer weights, then pass both outer weights explicitly to every train and validation-loss call. At epoch end atomically publish the full validation report and `best.pt` if improved, publish epoch telemetry, call `sampler.finish_epoch()`, clear the accumulator for the next epoch, publish `last.pt` with the epoch-record SHA-256, rebuild JSONL/CSV/PNG, then start the next epoch. A cursor-at-end resume with an exact existing epoch record completes this sequence idempotently; a next-epoch checkpoint without the bound record fails. Keep step JSONL and resolved training config with all source/cache/checkpoint identities and smoke bounds.
+- [ ] Test CLI preflight failures before model construction: schema other than 2, a 27-field or otherwise incomplete schema 2, wrong corrected Option D resolved-domain/domain/preset/manifest hash, non-increasing/duplicate front identity, missing raw TF or Ego epoch provenance, mismatched diagnostic report/counters, mixed-axis provenance, dirty cache, a malformed/nonexistent or internally inconsistent preprocessing source commit (without requiring equality to training HEAD), missing assets, wrong Python/Torch, either offline variable not exactly `1`, unavailable CUDA for an actual training invocation, zero/negative values for each `--max-*` smoke bound, and any offline `--sample-order` other than `manifest` or `reverse`. Test that omitted bounds preserve the YAML values, supplied positive bounds are recorded in the resolved run config and limit only that invocation, and reverse order changes traversal only while deterministic report rows remain sample-ID sorted.
+- [ ] Test a two-epoch fake-model fit: training boundary reapplied each epoch, selector and supervised-loss validation B=1, `last.pt` every epoch, `best.pt` only on strictly lower selected micro ADE, selected FDE/heading/macro plus minADE@32/minFDE@32 logged, and resume continues epoch/global step/RNG/accumulator exactly. Test crash reconciliation at (a) mid-epoch, (b) durable epoch JSON before sampler-finished `last.pt`, and (c) next-epoch `last.pt` with missing/mismatched epoch JSON, which must fail. Atomically publish `run-complete.json` only after all configured epochs finish with all three smoke bounds absent; it binds config/manifest/base/best hashes, epoch count, history/CSV/PNG hashes. Interrupted runs have no attestation. Any bounded invocation publishes exactly `debug/resolved-run-config.json`, `debug/last.pt`, optional `debug/best.pt`, `debug/validation.json`, and `debug/smoke-summary.json`; it must not publish authoritative `metrics/epochs`, history/CSV/PNG, root `last.pt`/`best.pt`, or `run-complete.json`.
+- [ ] Write telemetry tests first. One authoritative file per completed production epoch is `metrics/epochs/epoch-{epoch:04d}.json`, RFC 8785 canonical bytes, published by sibling `.partial`/file-fsync/replace/parent-fsync with no wall-clock, nonfinite value, per-sample record, seed, or nanosecond timestamp. It contains only finite aggregate validation metrics and the SHA-256 of the separately published deterministic strict-JSON validation report. Existing exact bytes are idempotent; conflicting bytes fail. From sorted epoch files, atomically rebuild `metrics/history.jsonl`, `metrics/epoch_metrics.csv`, and `plots/training-curves.png` rather than appending. CSV columns are epoch/global_step, train and validation total/trajectory/preservation loss, selected ADE/FDE/heading, minADE@32/minFDE@32, and best flag. PNG has exactly three labeled panels: train/validation total loss; selected ADE/FDE; minADE@32/minFDE@32. A generated plot is never resume state.
+- [ ] Implement `fit` with constant recommended AdamW learning rate from config; do not add an unapproved scheduler. Before constructing the optimizer, call `assert_loss_contract` against the loaded upstream head and resolved outer weights, then pass both outer weights explicitly to every train and validation-loss call. **Production branch (all bounds absent):** at epoch end atomically publish the full strict-JSON validation report and `best.pt` if improved, publish aggregate RFC 8785 epoch telemetry, call `sampler.finish_epoch()`, clear the accumulator for the next epoch, publish `last.pt` with the epoch-record SHA-256, rebuild JSONL/CSV/PNG, then start the next epoch. A cursor-at-end resume with an exact existing epoch record completes this sequence idempotently; a next-epoch checkpoint without the bound record fails. **Bounded branch (any bound present):** stop at the requested bound and publish only the exact five-path allowlist above (with `debug/best.pt` optional); never call the production epoch-telemetry/history/plot/attestation publishers or create root checkpoint names. The resolved config in either branch binds all source/cache/checkpoint identities and smoke bounds; production step JSONL stays derived/debug logging and is never resume state.
 - [ ] Run `.venv-train/bin/python -m pytest tests/unit/training/test_fit.py tests/unit/training/test_telemetry.py tests/unit/cli/test_train_cli.py tests/unit/cli/test_evaluate_cli.py -q`. Expected: PASS after the initial import failures are resolved.
-- [ ] When GPU preflight passes, run a one-batch smoke using real cached data and the official checkpoint with `epochs=1` override. Assert finite loss/gradients/metrics, nonzero allowed gradient, frozen tensor hashes unchanged, and last/best resume artifacts load.
+- [ ] When GPU preflight passes, run a one-batch bounded smoke using real cached data and the official checkpoint. Assert finite loss/gradients/metrics, nonzero allowed gradient, frozen tensor hashes unchanged, `debug/last.pt` plus any `debug/best.pt` resume artifacts load, and no authoritative epoch/run artifact exists.
 
 ```bash
 MORAI_MANIFEST="$(find cache/manifests/morai-ddv2-v1-oracle-command -mindepth 2 -maxdepth 2 -type f -name manifest.jsonl -print)"
 test "$(printf '%s\n' "$MORAI_MANIFEST" | sed '/^$/d' | wc -l)" -eq 1
-CUDA_VISIBLE_DEVICES=0 .venv-train/bin/python scripts/train.py \
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 .venv-train/bin/python scripts/train.py \
   --manifest "$MORAI_MANIFEST" \
   --resolved-domain artifacts/domain/morai-ddv2-v1-oracle-command/resolved-domain.json \
   --base-profile third_party/E2E-OpenLoop-ROS-Validator/src/Validator_pkg/config/profile.json \
@@ -1064,7 +1082,7 @@ def verify_validator_bundle(profile_file: Path, validator_root: Path) -> Verifie
 /profile-morai-ddv2-oracle.json
 ```
 - [ ] Test runtime assets with real absolute paths and actual hashes for checkpoint, checkpoint metadata, resolved domain, sensor preset, training manifest, image backbone, and trajectory anchor. Profile identity repeats domain ID, resolved hash, exported state hash, exact raw-schema hash, training manifest hash, cache schema 2, and clock-policy version 1.
-- [ ] Assert the generated profile's camera contract names the 640×480 side and 1280×720 front sources plus the exact 341/455/341 resize, `[56,1080)` crop, and RGB float32 output; LiDAR contract names `[1.5,0,1.25]`, the 3D self-mask, and count/5. Set `static_transforms.T_base_from_lidar` to identity rotation with translation `[1.5,0.0,1.25]`, and set `inference_policy.reference_stamp_policy` to `new_stamp_once`.
+- [ ] Assert the generated profile's camera contract names the 640×480 side and 1280×720 front sources plus the exact 341/455/341 resize, `[56,1080)` crop, and RGB float32 output; LiDAR contract names `[1.5,0,1.25]`, the 3D self-mask, and count/5. In the profile document, set `common_inference_policy.static_transforms.T_base_from_lidar` to identity rotation with translation `[1.5,0.0,1.25]`; after Validator `load_selected_profile`, assert the selected profile exposes that value at top-level `static_transforms.T_base_from_lidar`. Set the selected model's `inference_policy.reference_stamp_policy` to `new_stamp_once`.
 - [ ] Test preflight order with spies: Validator `load_selected_profile`→existing `verify_runtime_assets`→mandatory metadata read→checkpoint/profile/metadata file-hash equality→972 tensor and exact key/shape schema hashes→domain/sensor/manifest identity. Every metadata/hash/identity mismatch must fail before network construction. Only after those checks, construct the pinned PDM-free derivative, normalize 972→971, and invoke Validator's `load_diffusiondrive_selector_state_dict`, which must reach the derivative's actual `load_state_dict(normalized, strict=True)`; same-count renamed keys and wrong shapes fail there.
 
 ```python
@@ -1137,6 +1155,7 @@ git commit -m "feat: bind DDV2 export to Validator profile"
   tests/unit/cli/test_train_cli.py \
   tests/unit/cli/test_evaluate_cli.py \
   tests/unit/cli/test_export_cli.py -q
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
 MORAI_DDV2_VALIDATOR_ROOT="$PWD/third_party/E2E-OpenLoop-ROS-Validator" \
 .venv-train/bin/python -m pytest tests/integration/test_pinned_sel_loader.py -m upstream -q
 git diff --check
@@ -1150,7 +1169,7 @@ Expected: the ROS/preprocess suite runs only under Python 3.8, the training/expo
 ```bash
 MORAI_MANIFEST="$(find cache/manifests/morai-ddv2-v1-oracle-command -mindepth 2 -maxdepth 2 -type f -name manifest.jsonl -print)"
 test "$(printf '%s\n' "$MORAI_MANIFEST" | sed '/^$/d' | wc -l)" -eq 1
-CUDA_VISIBLE_DEVICES=0 .venv-train/bin/python scripts/train.py \
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 .venv-train/bin/python scripts/train.py \
   --manifest "$MORAI_MANIFEST" \
   --resolved-domain artifacts/domain/morai-ddv2-v1-oracle-command/resolved-domain.json \
   --base-profile third_party/E2E-OpenLoop-ROS-Validator/src/Validator_pkg/config/profile.json \
@@ -1162,13 +1181,13 @@ test "$(wc -l < runs/morai-ddv2-v1-oracle-command/metrics/epoch_metrics.csv)" -e
 test -s runs/morai-ddv2-v1-oracle-command/metrics/history.jsonl
 test -s runs/morai-ddv2-v1-oracle-command/plots/training-curves.png
 ```
-- [ ] Re-run offline validation for `best.pt` twice in manifest order and once in reverse order, then require byte-identical canonical reports. Each invocation resets the per-sample seed immediately before forward, and `cmp` therefore proves exact sample-ID prediction/seed and metric invariance.
+- [ ] Re-run offline validation for `best.pt` twice in manifest order and once in reverse order, then require byte-identical deterministic strict-JSON reports. Each invocation resets the per-sample seed immediately before forward, and `cmp` therefore proves exact sample-ID prediction/seed and metric invariance.
 
 ```bash
 MORAI_MANIFEST="$(find cache/manifests/morai-ddv2-v1-oracle-command -mindepth 2 -maxdepth 2 -type f -name manifest.jsonl -print)"
 test "$(printf '%s\n' "$MORAI_MANIFEST" | sed '/^$/d' | wc -l)" -eq 1
 for MORAI_REPORT_NAME in validation-manifest-1 validation-manifest-2; do
-  CUDA_VISIBLE_DEVICES=0 .venv-train/bin/python scripts/evaluate.py offline \
+  HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 .venv-train/bin/python scripts/evaluate.py offline \
     --manifest "$MORAI_MANIFEST" \
     --resolved-domain artifacts/domain/morai-ddv2-v1-oracle-command/resolved-domain.json \
     --base-profile third_party/E2E-OpenLoop-ROS-Validator/src/Validator_pkg/config/profile.json \
@@ -1176,7 +1195,7 @@ for MORAI_REPORT_NAME in validation-manifest-1 validation-manifest-2; do
     --report "runs/morai-ddv2-v1-oracle-command/${MORAI_REPORT_NAME}.json" \
     --sample-order manifest
 done
-CUDA_VISIBLE_DEVICES=0 .venv-train/bin/python scripts/evaluate.py offline \
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 .venv-train/bin/python scripts/evaluate.py offline \
   --manifest "$MORAI_MANIFEST" \
   --resolved-domain artifacts/domain/morai-ddv2-v1-oracle-command/resolved-domain.json \
   --base-profile third_party/E2E-OpenLoop-ROS-Validator/src/Validator_pkg/config/profile.json \
@@ -1193,7 +1212,7 @@ cmp runs/morai-ddv2-v1-oracle-command/validation-manifest-1.json \
 ```bash
 MORAI_MANIFEST="$(find cache/manifests/morai-ddv2-v1-oracle-command -mindepth 2 -maxdepth 2 -type f -name manifest.jsonl -print)"
 test "$(printf '%s\n' "$MORAI_MANIFEST" | sed '/^$/d' | wc -l)" -eq 1
-.venv-train/bin/python scripts/export_checkpoint.py \
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 .venv-train/bin/python scripts/export_checkpoint.py \
   --training-checkpoint runs/morai-ddv2-v1-oracle-command/best.pt \
   --base-checkpoint third_party/E2E-OpenLoop-ROS-Validator/models/diffusiondrive_v2/navsim_v2/diffusiondrivev2_sel.ckpt \
   --manifest "$MORAI_MANIFEST" \
@@ -1203,7 +1222,7 @@ test "$(printf '%s\n' "$MORAI_MANIFEST" | sed '/^$/d' | wc -l)" -eq 1
   --output artifacts/checkpoints/morai-ddv2-v1-oracle-command/ddv2-morai.ckpt \
   --profile-output configs/validator/profile-morai-ddv2-oracle.json
 
-.venv-train/bin/python scripts/validate_export.py \
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 .venv-train/bin/python scripts/validate_export.py \
   --profile configs/validator/profile-morai-ddv2-oracle.json \
   --validator-root third_party/E2E-OpenLoop-ROS-Validator
 git check-ignore -q configs/validator/profile-morai-ddv2-oracle.json
@@ -1213,13 +1232,15 @@ test -z "$(git ls-files --error-unmatch configs/validator/profile-morai-ddv2-ora
 - [ ] Run actual integration on GPU using fixed validation samples. Assert raw/runtime counts, strict load, unchanged frozen tensor hashes, finite output, `[1,8,3]`, and deterministic order invariance.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 MORAI_DDV2_VALIDATOR_ROOT="$PWD/third_party/E2E-OpenLoop-ROS-Validator" \
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 \
+MORAI_DDV2_VALIDATOR_ROOT="$PWD/third_party/E2E-OpenLoop-ROS-Validator" \
 .venv-train/bin/python -m pytest tests/integration/test_pinned_export_validator.py -m upstream -q
 ```
 
 - [ ] Run the pinned Validator loader regression without modifying its baseline profile.
 
 ```bash
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
 PYTHONPATH=third_party/E2E-OpenLoop-ROS-Validator/src/Validator_pkg/validator_inference/src \
 .venv-train/bin/python -m pytest -q \
   third_party/E2E-OpenLoop-ROS-Validator/src/Validator_pkg/validator_inference/test/test_runtime_integrity.py \
