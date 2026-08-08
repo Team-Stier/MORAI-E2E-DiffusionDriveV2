@@ -74,6 +74,12 @@ def test_domain_yaml_contains_policy_but_not_preset_owned_sensor_values(repo_roo
                 "receipt_stamp_ns",
                 "stable_record_index",
             ],
+            "selected_header_identity": {
+                "receipt_grid_order": "strictly_increasing",
+                "unique": True,
+                "stable_record_reuse_allowed": False,
+                "violation_bag_reject_reason": "FRONT_TIMESTAMP_ORDER_VIOLATION",
+            },
         },
         "side_camera": {
             "candidate_filters": [
@@ -105,6 +111,7 @@ def test_domain_yaml_contains_policy_but_not_preset_owned_sensor_values(repo_roo
             ],
         },
         "trajectory_anchor_tf": {
+            "source_view": "raw_map_to_base_link_records",
             "selection_axis": "receipt_stamp_ns",
             "tolerance_ns": 50_000_000,
             "tie_break_order": [
@@ -112,31 +119,80 @@ def test_domain_yaml_contains_policy_but_not_preset_owned_sensor_values(repo_roo
                 "receipt_stamp_ns",
                 "stable_record_index",
             ],
-            "current_pose": "exact_selected_native_header",
+            "current_pose": "exact_selected_raw_record",
+            "preserve_original_stable_record_index": True,
             "fallback_to_second_candidate": False,
         },
         "ego_state": {
             "interpolation_axis": "header_stamp_ns",
             "target": "trajectory_anchor_tf_header_ns",
             "max_bracket_ns": 100_000_000,
+            "clock_epoch": {
+                "index_origin": 0,
+                "source_view": "raw_ego_records",
+                "ordering": ["receipt_stamp_ns", "stable_record_index"],
+                "new_epoch_condition": "header_stamp_ns_strictly_decreases",
+                "selector_relative_to": "trajectory_anchor_tf_receipt_ns",
+                "selector_axis": "receipt_stamp_ns",
+                "selector_tolerance": "none",
+                "selector_tie_break_order": [
+                    "absolute_receipt_offset_ns",
+                    "receipt_stamp_ns",
+                    "stable_record_index",
+                ],
+                "interpolation_view": "selected_epoch_collapsed_header_view",
+                "equal_header_duplicate_policy": (
+                    "collapse_equivalent_earliest_in_epoch_reject_conflict"
+                ),
+                "fallback_to_other_epoch": False,
+            },
         },
         "future_pose": {
             "interpolation_axis": "header_stamp_ns",
             "target_origin": "trajectory_anchor_tf_header_ns",
             "max_bracket_ns": 100_000_000,
-            "same_tf_clock_epoch_required": True,
-            "causal_suffix_from_anchor_required": True,
+            "source_view": "selected_raw_anchor_same_epoch_causal_suffix",
+            "equal_header_duplicate_policy": (
+                "collapse_equivalent_earliest_at_or_after_anchor_reject_conflict"
+            ),
             "extrapolation_allowed": False,
+            "fallback_to_other_epoch": False,
         },
         "tf_clock_epoch": {
+            "index_origin": 0,
+            "source_view": "raw_map_to_base_link_records",
             "ordering": ["receipt_stamp_ns", "stable_record_index"],
             "monotonic_header_rule": "nondecreasing",
             "new_epoch_condition": "header_stamp_ns_strictly_decreases",
-            "equal_header_duplicate_policy": "collapse_equivalent_earliest_reject_conflict",
+            "within_epoch_interpolation_view": "collapsed_header_view",
+            "equal_header_duplicate_policy": (
+                "collapse_equivalent_earliest_in_view_reject_conflict"
+            ),
+            "same_header_across_epochs": "allowed_epoch_index_disambiguates",
         },
         "tf_ego_bag_gate": {
             "axis": "native_header_stamp_ns",
             "scope": "full_stream",
+            "ego_source_view": "raw_ego_records",
+            "tf_epoch_selector": {
+                "source_view": "raw_map_to_base_link_records",
+                "relative_to": "ego_receipt_stamp_ns",
+                "selection_axis": "receipt_stamp_ns",
+                "tolerance": "none",
+                "tie_break_order": [
+                    "absolute_receipt_offset_ns",
+                    "receipt_stamp_ns",
+                    "stable_record_index",
+                ],
+            },
+            "interpolation_view": "selected_tf_epoch_collapsed_header_view",
+            "max_bracket_ns": 100_000_000,
+            "fallback_to_other_epoch": False,
+            "excluded_case_counters": [
+                "no_epoch_local_bracket",
+                "ambiguous_epoch_selection",
+                "cross_epoch_bracket_prevented",
+            ],
         },
         "tolerance_boundary_inclusive": True,
         "interpolation_exact_match_weight": 0.0,
@@ -152,6 +208,30 @@ def test_domain_yaml_contains_policy_but_not_preset_owned_sensor_values(repo_roo
         "STRAIGHT",
         "UNKNOWN_AMBIGUOUS",
     ]
+    assert raw_domain["domain_lifecycle"] == {
+        "contract_revision_context": "pre_first_production_unpublished",
+        "after_first_production_publication": "new_domain_id_required",
+        "breaking_change_kinds": ["clock_policy", "cache_schema"],
+    }
+    assert raw_domain["diagnostics"]["tf_ego_epoch_safe_report"] == {
+        "provenance_fields": [
+            "ego_header_stamp_ns",
+            "ego_receipt_stamp_ns",
+            "ego_stable_record_index",
+            "selected_tf_clock_epoch_index",
+            "selected_tf_anchor_record_index",
+            "tf_bracket_header_stamp_ns",
+            "tf_bracket_receipt_ns",
+            "tf_bracket_record_index",
+        ],
+        "counters": [
+            "raw_ego_record_count",
+            "epoch_local_comparable_count",
+            "no_epoch_local_bracket_count",
+            "ambiguous_epoch_selection_count",
+            "cross_epoch_bracket_prevented_count",
+        ],
+    }
     cache = raw_domain["cache"]
     assert cache["schema_version"] == 2
     assert cache["command_sidecar_schema_version"] == 2
@@ -176,6 +256,7 @@ def test_domain_yaml_contains_policy_but_not_preset_owned_sensor_values(repo_roo
         "trajectory_anchor_tf_receipt_ns": {"dtype": "int64", "shape": ["N"]},
         "trajectory_anchor_tf_record_index": {"dtype": "int64", "shape": ["N"]},
         "trajectory_anchor_tf_clock_epoch_index": {"dtype": "int64", "shape": ["N"]},
+        "ego_bracket_clock_epoch_index": {"dtype": "int64", "shape": ["N"]},
         "ego_bracket_header_stamp_ns": {"dtype": "int64", "shape": ["N", 2]},
         "ego_bracket_receipt_ns": {"dtype": "int64", "shape": ["N", 2]},
         "ego_bracket_record_index": {"dtype": "int64", "shape": ["N", 2]},
@@ -212,6 +293,12 @@ def test_domain_yaml_contains_policy_but_not_preset_owned_sensor_values(repo_roo
         "command_index",
         "command_name",
         "provenance",
+    ]
+    assert len(cache["datasets"]) == 28
+    assert len(cache["datasets"]) - 4 == 24
+    assert len(cache["command_record_fields"]) == 13
+    assert "FRONT_TIMESTAMP_ORDER_VIOLATION" in raw_domain["validity"][
+        "bag_reject_reasons"
     ]
     assert raw_domain["split"]["seed_prefix"] == "20260806:"
 

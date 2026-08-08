@@ -16,6 +16,8 @@
 - Begin every project Python module with `from __future__ import annotations`; Python 3.8 code must not evaluate PEP 585/604 annotations at import time.
 - Use integer nanoseconds for every selection and interpolation decision. Follow audited Option D: receipt is recorder observation/order clock for grid/front/LiDAR/local-TF association, while side exposure and Ego/future physics use native Header. Receipt is not acquisition time and no production affine bridge is allowed.
 - Every raw ROS record interface names both `header_stamp_ns` and `receipt_stamp_ns`; an ambiguous single `stamp_ns` is allowed only in the ROS-free one-axis interpolation primitive from Task 3, never as raw ROS provenance.
+- Keep raw TF/Ego receipt-order records and immutable epoch/interpolation views separate. A raw receipt-nearest current TF anchor preserves its original stable index; duplicate collapse is applied only inside the explicitly selected Header interpolation view.
+- `morai-ddv2-v1-oracle-command` is pre-first-production/unpublished during this plan. After its first production publication, any clock-policy or cache-schema change requires a new domain ID rather than in-place mutation.
 - Unit tests under `tests/unit` must not import ROS. ROS imports are confined to `src/morai_ddv2/ros1`.
 - The cache generator must refuse dirty source by default. A development override records the dirty diff hash and produces artifacts that the production training loader rejects.
 - Never include `.bag.active`, never cross bag boundaries, and never substitute GPS/IMU for missing `/tf` or `/Ego_topic` in v1.
@@ -175,7 +177,7 @@ def test_morai_camera_rotation_matches_bag_tf(pitch, yaw, expected):
 ```
 
 - [ ] Run `.venv-ros/bin/python -m pytest tests/unit/config -q`. Expected: collection/import FAIL.
-- [ ] Encode policy and non-preset contracts in the YAML: required ROS message types, versioned Option D clock axes/tolerances/ties/TF epoch policy, camera resize/crop, LiDAR mask/binning, trajectory horizon, ordered command rules, diagnostics, cache/manifest/sidecar schema 2, and split seed. Resolver-derived topics, frames, physical dimensions/FOV/extrinsics come only from `0725demo_ros.json`; do not duplicate those preset-owned values in YAML.
+- [ ] Encode policy and non-preset contracts in the YAML: required ROS message types; versioned Option D clock axes/tolerances/ties; raw-anchor versus zero-based TF/Ego epoch interpolation views; selected-front Header strict identity gate; epoch-safe diagnostic provenance/counters; camera resize/crop; LiDAR mask/binning; trajectory horizon; ordered command rules; exactly 28 HDF5 datasets, 24 non-tensor provenance values repeated by each sample manifest row, and the independent 13-field command-sidecar schema under cache schema 2; pre-publication lifecycle; and split seed. Resolver-derived topics, frames, physical dimensions/FOV/extrinsics come only from `0725demo_ros.json`; do not duplicate those preset-owned values in YAML.
 - [ ] Implement `morai_camera_quaternion` as the Hamilton product `q_y(pitch) * q_z(wrap_degrees(yaw))`, normalize the result, and reject `abs(roll_deg) > 1e-12`.
 - [ ] Parse camera IDs 1/2/3 and LiDAR ID 4 from the preset, converting numeric strings once into immutable dataclasses. Record but do not use `focalLengthpixel`; record the FOV/principal-point inconsistency in the resolved document.
 - [ ] Build the resolved document without its own hash, serialize it with `rfc8785.dumps`, compute the digest, then expose the digest beside the immutable document. `resolved_domain_sha256` is never included in the bytes it hashes.
@@ -312,6 +314,8 @@ def relative_se2(current: Pose, future: Pose) -> tuple[float, float, float]
 def nearest_rank_percentile(values: Sequence[float], percentile: float) -> float
 def compute_tf_ego_diagnostic(ego_records, tf_records, max_bracket_ns: int) -> TfEgoDiagnostic
 ```
+
+`compute_tf_ego_diagnostic` is the numeric single-Header-view primitive only. Task 8 must add the public epoch-safe raw-record selector that chooses one TF epoch per raw Ego receipt, calls this primitive only with that epoch-local immutable interpolation view, and records selection/bracket provenance plus exclusions. Passing a global Header-sorted TF stream to the primitive is forbidden.
 
 - [ ] Write geometry tests for zero-norm rejection, q/−q angular equivalence, `dot < 0` sign correction, the `dot > 0.9995` normalized-linear branch, a general SLERP branch, yaw `179.9° → -179.9°`, rigid point transform, and current-frame SE(2) relative coordinates.
 - [ ] Write diagnostics tests with at least 10 comparable pairs; use nearest-rank index `ceil(0.99*N)-1`. For N=100, one isolated high maximum must not move p99 beyond tolerance, while two over-tolerance values must reject. Heading comparison converts Ego degrees to radians and uses circular difference.
@@ -500,8 +504,10 @@ git commit -m "feat: generate trajectory targets and oracle commands"
 - Create: `src/morai_ddv2/ros1/__init__.py`
 - Create: `src/morai_ddv2/ros1/messages.py`
 - Create: `src/morai_ddv2/ros1/bag_reader.py`
+- Modify: `src/morai_ddv2/preprocess/diagnostics.py`
 - Create: `tests/unit/ros1/test_messages.py`
 - Create: `tests/unit/ros1/test_bag_reader.py`
+- Modify: `tests/unit/preprocess/test_diagnostics.py`
 - Create: `tests/integration/test_real_bag_inventory.py`
 
 **Interfaces:**
@@ -522,12 +528,67 @@ class ValueRecord(Generic[T]):
     value: T
 
 @dataclass(frozen=True)
+class EgoRecord:
+    header_stamp_ns: int
+    receipt_stamp_ns: int
+    stable_record_index: int
+    clock_epoch_index: int
+    value: EgoValue
+
+@dataclass(frozen=True)
 class TfPoseRecord:
     header_stamp_ns: int
     receipt_stamp_ns: int
     stable_record_index: int
     clock_epoch_index: int
     value: Pose
+
+@dataclass(frozen=True)
+class ClockEpochView(Generic[T]):
+    index: int
+    raw_records: tuple[T, ...]
+    interpolation_records: tuple[T, ...]
+
+@dataclass(frozen=True)
+class TfEgoGateProvenance:
+    ego_header_stamp_ns: int
+    ego_receipt_stamp_ns: int
+    ego_stable_record_index: int
+    selected_tf_clock_epoch_index: int
+    selected_tf_anchor_record_index: int
+    tf_bracket_header_stamp_ns: tuple[int, int] | None
+    tf_bracket_receipt_ns: tuple[int, int] | None
+    tf_bracket_record_index: tuple[int, int] | None
+    exclusion_reason: Literal["NO_EPOCH_LOCAL_BRACKET", "AMBIGUOUS_EPOCH_SELECTION", "CROSS_EPOCH_BRACKET_PREVENTED"] | None
+
+@dataclass(frozen=True)
+class EpochSafeTfEgoDiagnostic:
+    metric: TfEgoDiagnostic
+    provenance: tuple[TfEgoGateProvenance, ...]
+    raw_ego_record_count: int
+    epoch_local_comparable_count: int
+    no_epoch_local_bracket_count: int
+    ambiguous_epoch_selection_count: int
+    cross_epoch_bracket_prevented_count: int
+
+class SensorPayloadKind(str, Enum):
+    CAMERA_JPEG = "CAMERA_JPEG"
+    LIDAR_XYZI = "LIDAR_XYZI"
+
+@dataclass(frozen=True)
+class SensorPayload:
+    ref: RecordRef
+    kind: SensorPayloadKind
+    value: Union[bytes, np.ndarray]
+
+@dataclass(frozen=True)
+class SensorPayloadFailure:
+    topic: str
+    stable_record_index: int
+    reason: Literal["DECODE_ERROR"]
+    detail: str
+
+PayloadEvent = Union[SensorPayload, SensorPayloadFailure]
 
 @dataclass(frozen=True)
 class BagIndex:
@@ -538,17 +599,24 @@ class BagIndex:
     left: tuple[RecordRef, ...]
     right: tuple[RecordRef, ...]
     lidar: tuple[RecordRef, ...]
-    ego: tuple[ValueRecord[EgoValue], ...]
-    poses: tuple[TfPoseRecord, ...]
+    raw_ego: tuple[EgoRecord, ...]
+    ego_clock_epochs: tuple[ClockEpochView[EgoRecord], ...]
+    raw_poses: tuple[TfPoseRecord, ...]
+    tf_clock_epochs: tuple[ClockEpochView[TfPoseRecord], ...]
     extrinsics: tuple[ValueRecord[Extrinsic], ...]
 
 def index_bag(path: Path, domain: ResolvedDomain) -> BagIndex
-def iter_selected_payloads(path: Path, selected_indices: Mapping[str, set[int]]) -> Iterator[SensorPayload]
+def causal_tf_interpolation_view(epoch: ClockEpochView[TfPoseRecord], anchor: TfPoseRecord) -> tuple[TfPoseRecord, ...]
+def compute_epoch_safe_tf_ego_diagnostic(index: BagIndex, max_bracket_ns: int) -> EpochSafeTfEgoDiagnostic
+def iter_selected_payloads(path: Path, selected_indices: Mapping[str, set[int]]) -> Iterator[PayloadEvent]
 def discover_bags(bag_root: Path) -> tuple[Path, ...]
 ```
 
 - [ ] Test ROS message conversion with minimal fake objects so imports remain lazy. Header and bag-read receipt convert independently as `secs*1_000_000_000+nsecs`; every ROS record exposes both explicit fields. Camera/LiDAR/Ego stable indices are per topic; `/tf` stable indices count every flattened `TransformStamped` in message order, not TFMessage envelopes.
-- [ ] Test TF clock epochs in receipt/index order: equal/nondecreasing native Headers stay in one epoch, a strict Header backstep starts the next epoch, equivalent equal-Header duplicates collapse to earliest within that epoch, and conflicts reject. Never infer epochs from Header-sorted order.
+- [ ] Test TF and Ego clock epochs independently in raw receipt/index order with zero-based indices: equal/nondecreasing native Headers stay in one epoch and a strict Header backstep starts the next. `raw_poses`/`raw_ego` retain every original stable index. Each immutable `ClockEpochView.raw_records` retains the epoch slice while `interpolation_records` collapses equivalent equal-Header records to earliest within that view and rejects within-epoch conflict. Same native Header in different TF epochs is allowed because epoch index disambiguates; include the equivalent 154843 pattern. Never infer epochs from Header-sorted order.
+- [ ] Test `causal_tf_interpolation_view`: start with the selected raw anchor inclusive, stay in its epoch, then collapse equivalent equal Headers to earliest at-or-after-anchor. An equivalent earlier duplicate must not replace the anchor, and a future bracket must never use another epoch or a record before the raw anchor.
+- [ ] Test the full-stream epoch-safe TF/Ego gate. For every raw Ego record, choose receipt-nearest raw TF by `(abs receipt delta, receipt, stable index)` with no tolerance solely to select its TF epoch; bracket the Ego native Header only in that epoch's `interpolation_records` within 100 ms and never fallback. Assert raw-Ego/selected-TF/bracket provenance plus separate raw/comparable/no-bracket/ambiguous/cross-prevented counters. Include fixtures where a global Header view chooses the wrong epoch or straddles two epochs and prove the public API excludes/reports them.
+- [ ] Add a read-only 30-bag audit assertion/report: global TF Header association had the wrong epoch for 841/387,145 raw Ego records and 114 cross-epoch brackets; corrected epoch-local comparable count is 386,438, no bag gate result changes, and maximum bag-p99 delta is 0.000306 m/0.000865 deg. Treat these as audit expectations, not hard-coded production selection shortcuts.
 - [ ] Test inventory classification: finalized bags with all required topics are eligible; `.bag.active` is excluded; finalized bags missing both `/tf` and `/Ego_topic` are `SENSOR_ONLY_EXCLUDED`; exactly one missing GT topic or a missing core sensor is a bag rejection.
 - [ ] Test pass 2 with a fake reader: only the selected topic-local record indices are decoded/materialized, while unrelated JPEG/PointCloud payloads are never copied into `BagIndex`.
 
@@ -564,7 +632,7 @@ def pointcloud_xyz_i(message) -> np.ndarray:
 ```
 
 - [ ] Run `.venv-ros/bin/python -m pytest tests/unit/ros1 -q`. Expected: FAIL.
-- [ ] Implement pass 1 to validate connection types, Header frames, parseable JPEG resolutions, PointCloud layout, canonical `/tf` extrinsics, duplicate Ego fields, duplicate `map→base_link` transforms, TF clock epochs, and the full-stream native-Header TF/Ego p99 bag gate. Receipt-aligned/affine diagnostics are forbidden. A JPEG whose header/payload cannot be decoded is a per-record `DECODE_ERROR`, not a bag contract failure; a successfully inspected/decoded image with a noncanonical size is bag-level `RESOLUTION_MISMATCH`. Stream-decode every front JPEG during indexing, discard its pixels immediately, and include only fully decode-valid front records when determining `first_valid_front_receipt_ns`; a corrupt early front frame can never shift receipt-grid origin. Keep left/right record ordering unchanged so the Task 9 dual-filter occurs before pass-2 decode, and reject the entire bag only for a declared bag-level enum reason.
+- [ ] Implement pass 1 to validate connection types, Header frames, parseable JPEG resolutions, PointCloud layout, canonical `/tf` extrinsics, within-epoch duplicate Ego/`map→base_link` conflicts, immutable raw/clock-epoch/interpolation views, and the full-stream epoch-safe native-Header TF/Ego p99 bag gate. Receipt-aligned/global-Header/affine diagnostics are forbidden. A JPEG whose header/payload cannot be decoded is a per-record `DECODE_ERROR`, not a bag contract failure; a successfully inspected/decoded image with a noncanonical size is bag-level `RESOLUTION_MISMATCH`. Stream-decode every front JPEG during indexing, discard its pixels immediately, and include only fully decode-valid front records when determining `first_valid_front_receipt_ns`; a corrupt early front frame can never shift receipt-grid origin. Keep left/right record ordering unchanged so the Task 9 dual-filter occurs before pass-2 decode, and reject the entire bag only for a declared bag-level enum reason.
 - [ ] Store `/Ego_topic` only as velocity/acceleration plus diagnostic position/degree heading. Store canonical pose only from `/tf map→base_link`. Normalize leading slashes in frame names.
 - [ ] Add an opt-in real-bag inventory test keyed by `MORAI_REAL_BAG`; when unset it skips. When set it records the file size/mtime before and after and proves inspection did not mutate it.
 - [ ] Run `.venv-ros/bin/python -m pytest tests/unit/ros1 -q`. Expected: PASS. Then run the opt-in real-bag inventory test:
@@ -608,13 +676,20 @@ class SampleDropReason(str, Enum):
     INVALID_COMMAND = "INVALID_COMMAND"
     EMPTY_LIDAR = "EMPTY_LIDAR"
 
+class BagRejectReason(str, Enum):
+    # ...the other resolved-domain bag reasons...
+    FRONT_TIMESTAMP_ORDER_VIOLATION = "FRONT_TIMESTAMP_ORDER_VIOLATION"
+
 def build_sample_plan(bag: BagIndex, domain: ResolvedDomain) -> BagSamplePlan
 def materialize_samples(*, bag_path: Path, plan: BagSamplePlan, domain: ResolvedDomain) -> Iterator[CacheSample]
 ```
 
-- [ ] Test the exact Option D pipeline. Build a 2 Hz receipt grid from the first valid front receipt; front is receipt-nearest within inclusive 50 ms. Side candidates first satisfy inclusive `|Header-front Header|<=30 ms` and `|receipt-front receipt|<=100 ms`, then use `(abs Header delta, Header, stable index)`. Include a regression where the Header-nearest first candidate violates the receipt bound and the valid second candidate is selected. LiDAR is receipt-nearest within 45 ms. `map→base_link` TF is receipt-nearest within 50 ms with no fallback to a second candidate; its native Header `T0` is exact current pose. Ego brackets Header `T0` within 100 ms. Eight future requests use Header `T0+(0.5,...,4.0)s` only in the anchor's same receipt-order TF epoch causal suffix with 100 ms max gaps and no extrapolation.
-- [ ] Add TF reset tests: a future that would require crossing a strict native-Header backstep maps to `FUTURE_HORIZON_MISS`; anchor TF miss maps to `POSE_INTERPOLATION_MISS`; side dual-bound/front miss maps to `CAMERA_SYNC_MISS`; LiDAR and Ego map to their existing exact enums. Never reselect a runner-up after a chosen nearest record fails a later gate.
-- [ ] Assert explicit provenance: sensor axes are front,left,right,lidar; `side_camera_header_offset_ns` is left/right Header minus front Header; `sensor_receipt_offset_ns` is left/right/lidar receipt minus front receipt. Retain grid receipt, exact trajectory-anchor TF Header/receipt/index/epoch, and every Ego/current/future Header+receipt+index bracket with float32 weights. Do not emit a LiDAR Header sync offset.
+- [ ] Test the exact Option D pipeline. Build a 2 Hz receipt grid from the first valid front receipt; front is receipt-nearest within inclusive 50 ms. Before any sample publication assert receipt-grid-order selected front Headers are strictly increasing and unique and selected front stable indices are not reused. A `<=` Header, duplicate Header, or reused stable index rejects the whole bag as `FRONT_TIMESTAMP_ORDER_VIOLATION`; never downgrade it to a sample drop or `NO_VALID_SAMPLE`. Include the audited normal case and a synthetic failure for each invariant.
+- [ ] Side candidates first satisfy inclusive `|Header-front Header|<=30 ms` and `|receipt-front receipt|<=100 ms`, then use `(abs Header delta, Header, stable index)`. Include a regression where the Header-nearest first candidate violates the receipt bound and the valid second candidate is selected. LiDAR is receipt-nearest within 45 ms.
+- [ ] Select `map→base_link` only from `bag.raw_poses` by receipt within 50 ms with no runner-up fallback. Equivalent same-Header duplicates remain distinct raw anchors and current pose preserves the chosen raw Header/receipt/original stable index. Build future `T0+(0.5,...,4.0)s` only from `causal_tf_interpolation_view` for that raw anchor: same zero-based epoch, suffix starts anchor inclusive, equivalent equal Headers collapse to earliest at-or-after-anchor, gap <=100 ms, no extrapolation or other-epoch fallback. A reset/crossing maps to `FUTURE_HORIZON_MISS`; raw anchor miss maps to `POSE_INTERPOLATION_MISS`.
+- [ ] For current Ego, choose receipt-nearest `bag.raw_ego` record to the raw TF anchor receipt by `(abs receipt delta, receipt, stable index)` with no tolerance solely to select its independent zero-based Ego epoch. Bracket `T0` only in that `ego_clock_epochs[index].interpolation_records` within 100 ms. Do not interpolate on receipt or fallback to another Ego epoch. Include a global-Header-would-succeed/local-must-drop case and a different-epoch-closer-Header case.
+- [ ] The read-only 30-bag current-Ego audit reports 16/30 bags with 44 raw Ego Header backsteps/overlaps; for 13,711 TF anchors global/local valid counts are 13,669/13,664, eight global results mismatch, five corrected drops are in 164630, and the remaining three source/value changes have maximum used-component absolute delta 0.0006319193. Do not encode these counts into the planner; use them only as real-bag regression evidence.
+- [ ] Assert explicit provenance: sensor axes are front,left,right,lidar; `side_camera_header_offset_ns` is left/right Header minus front Header; `sensor_receipt_offset_ns` is left/right/lidar receipt minus front receipt. Retain grid receipt, exact raw trajectory-anchor TF Header/receipt/index/epoch, `ego_bracket_clock_epoch_index`, and every Ego/current/future Header+receipt+index bracket with float32 weights. TF and Ego epoch indices are independent. Do not emit a LiDAR Header sync offset.
 
 ```python
 @dataclass(frozen=True)
@@ -634,6 +709,7 @@ class CacheSample:
     trajectory_anchor_tf_receipt_ns: int
     trajectory_anchor_tf_record_index: int
     trajectory_anchor_tf_clock_epoch_index: int
+    ego_bracket_clock_epoch_index: int
     ego_bracket_header_stamp_ns: tuple[int, int]
     ego_bracket_receipt_ns: tuple[int, int]
     ego_bracket_record_index: tuple[int, int]
@@ -650,9 +726,9 @@ class CacheSample:
 ```
 
 - [ ] Run `.venv-ros/bin/python -m pytest tests/unit/preprocess/test_planner.py tests/unit/preprocess/test_materialize.py -q`. Expected: FAIL.
-- [ ] Implement planning over lightweight refs and interpolated Ego/TF values. `timestamp_ns` remains selected-front Header while grid/front/LiDAR/TF receipt association uses explicit receipt values. A single raw sensor record may serve several anchors, but each sample retains actual Header, receipt and index. Current pose provenance is exact `[T0,T0]`, `[R0,R0]`, `[i0,i0]`, weight 0.
+- [ ] Implement planning over lightweight refs and immutable raw/epoch views. `timestamp_ns` remains selected-front Header while grid/front/LiDAR/raw-TF receipt association uses explicit receipt values. A side/LiDAR/state record may serve several anchors, but selected front records may not be reused and every sample retains actual Header, receipt and original index. Current pose provenance is the chosen raw TF exact `[T0,T0]`, `[R0,R0]`, `[i0,i0]`, weight 0. Ego provenance binds the separately selected epoch index and its epoch-local bracket.
 - [ ] Materialize selected JPEG/PointCloud payloads in pass 2, call only the pure camera/LiDAR/trajectory/status functions, validate dtype/shape/range/finite before yielding, and reject a bag that ends with no valid samples.
-- [ ] Ensure a corrupt selected sensor payload drops only that anchor as `DECODE_ERROR`; a successfully decoded noncanonical camera size remains bag-level `RESOLUTION_MISMATCH`. Preset resolution, type, frame, extrinsic, duplicate conflict, and TF/Ego p99 failures are all discovered before final cache publication.
+- [ ] Ensure a corrupt selected sensor payload drops only that anchor as `DECODE_ERROR`; a successfully decoded noncanonical camera size remains bag-level `RESOLUTION_MISMATCH`. Preset resolution, type, frame, extrinsic, within-epoch duplicate conflict, strict front identity, and epoch-safe TF/Ego p99 failures are all discovered before final cache publication.
 - [ ] Run `.venv-ros/bin/python -m pytest tests/unit/preprocess/test_planner.py tests/unit/preprocess/test_materialize.py -q`, then `.venv-ros/bin/python -m pytest tests/unit -q`. Expected: both commands PASS.
 - [ ] Commit.
 
@@ -679,7 +755,7 @@ def read_command_sidecar(path: Path, expected_identity: CommandSidecarIdentity) 
 def verify_bag_artifact(record: BagArtifactRecord, cache_root: Path) -> None
 ```
 
-- [ ] Write a two-sample schema-v2 round-trip test that asserts every required HDF5 dataset name, exact dtype/shape, HDF5 attributes `cache_schema_version=2` and `clock_policy_version=1`, ascending front-Header timestamps, sample IDs, and all dual-clock provenance arrays. Assert `status[:4]` is exactly the one-hot form of the same command record written to JSONL.
+- [ ] Write a two-sample schema-v2 round-trip test that asserts exactly 28 required HDF5 dataset names—four tensor datasets plus 24 dual-clock/TF-epoch/Ego-epoch provenance datasets—exact dtype/shape, HDF5 attributes `cache_schema_version=2` and `clock_policy_version=1`, strictly increasing unique front-Header timestamps, unique front stable indices, and sample IDs. Assert `status[:4]` is exactly the one-hot form of the same command record written to JSONL.
 - [ ] Assert each sidecar row declares `schema_version=2` and includes domain, resolved-domain, preset, bag, and command-rule SHA-256 identities plus `timestamp_ns`, `grid_receipt_ns`, `front_receipt_ns`, and `front_record_index`; lookup remains bag hash+timestamp. LEFT/STRAIGHT/RIGHT/UNKNOWN indices are 0/1/2/3; provenance is exactly `future_trajectory_oracle`; duplicate timestamps fail.
 - [ ] Inject write, file-fsync, replace, and directory-fsync failures. No final HDF5/sidecar path may appear unless its contents are complete and hash-verifiable; a `.partial` may remain and must be ignored later.
 
@@ -700,6 +776,7 @@ HDF5_DATASETS = {
     "trajectory_anchor_tf_receipt_ns": (np.int64, ()),
     "trajectory_anchor_tf_record_index": (np.int64, ()),
     "trajectory_anchor_tf_clock_epoch_index": (np.int64, ()),
+    "ego_bracket_clock_epoch_index": (np.int64, ()),
     "ego_bracket_header_stamp_ns": (np.int64, (2,)),
     "ego_bracket_receipt_ns": (np.int64, (2,)),
     "ego_bracket_record_index": (np.int64, (2,)),
@@ -753,6 +830,8 @@ class DatasetManifestRecord(TypedDict):
     resolved_domain_sha256: str
     sensor_preset_sha256: str
     source_code_commit: str
+    contract_revision_context: Literal["pre_first_production_unpublished"]
+    after_first_production_publication: Literal["new_domain_id_required"]
     split_seed_prefix: Literal["20260806:"]
     train_relative_bag_paths: list[str]
     validation_relative_bag_paths: list[str]
@@ -772,6 +851,13 @@ class BagManifestRecord(TypedDict):
     sidecar_record_count: int
     drop_counts: dict[str, int]
     rejection_code: str | None
+    tf_ego_diagnostic_report_path: str | None
+    tf_ego_diagnostic_report_sha256: str | None
+    tf_ego_raw_record_count: int
+    tf_ego_epoch_local_comparable_count: int
+    tf_ego_no_epoch_local_bracket_count: int
+    tf_ego_ambiguous_epoch_selection_count: int
+    tf_ego_cross_epoch_bracket_prevented_count: int
 
 class SampleManifestRecord(TypedDict):
     record_type: Literal["sample"]
@@ -792,6 +878,7 @@ class SampleManifestRecord(TypedDict):
     trajectory_anchor_tf_receipt_ns: int
     trajectory_anchor_tf_record_index: int
     trajectory_anchor_tf_clock_epoch_index: int
+    ego_bracket_clock_epoch_index: int
     ego_bracket_header_stamp_ns: list[int]
     ego_bracket_receipt_ns: list[int]
     ego_bracket_record_index: list[int]
@@ -841,7 +928,7 @@ def load_tensor_sample(manifest: VerifiedManifest, sample_id: str) -> ModelSampl
 - [ ] Write split tests using symlink-resolved regular files and UTF-8 POSIX relative paths. Sort by `(SHA256(b"20260806:"+path_bytes).digest(), path_bytes)`; with N=30 assert exactly 24 train and 6 validation bags and no bag appears in both.
 - [ ] Write loader tests proving the final manifest is the only commit marker: referenced valid artifacts load; orphan final files and every `.partial` are ignored; missing/hash-mismatched HDF5 or sidecar fails; changed path/hash/split list fails reuse; dirty-override artifacts fail in production mode.
 - [ ] Publish the exact canonical snapshot at `domains/{domain_id}/{resolved_domain_sha256}/resolved-domain.json`; its bytes/hash are immutable and the manifest stores its relative path and hash. Loader derives this path from the manifest, verifies its bytes/self-excluding hash and the current `sensor_preset_path` hash, and never re-resolves YAML/preset.
-- [ ] Define JSONL record types exactly: one schema-v2 `dataset` record with domain/snapshot/code/split identities; one `bag` record per eligible/excluded/rejected path with source hash, split, artifact paths/hashes/counts and drop stats; and one timestamp-sorted `sample` record per cached row that repeats every HDF5 dual-clock provenance field by the exact same name/value plus sample/bag/split/HDF5/sidecar/command identity. Tests reject schema 1, unknown/missing fields, HDF5/manifest provenance mismatch, mixed clock-axis offsets, and duplicate sample IDs.
+- [ ] Define JSONL record types exactly: one schema-v2 `dataset` record with domain/snapshot/code/split/lifecycle identities; one `bag` record per eligible/excluded/rejected path with source hash, split, artifact paths/hashes/counts, drop stats, `FRONT_TIMESTAMP_ORDER_VIOLATION`, and epoch-safe TF/Ego diagnostic provenance/counters; and one timestamp-sorted `sample` record per cached row that repeats exactly the 24 non-tensor HDF5 provenance datasets by the same name/value plus sample/bag/split/HDF5/sidecar/command identity. Camera/LiDAR/status/trajectory tensor values stay in HDF5 and are not copied into JSONL. Tests reject schema 1, unknown/missing fields, HDF5/manifest provenance mismatch, mixed clock-axis offsets, duplicate/non-increasing sample timestamps, reused front indices, and duplicate sample IDs.
 - [ ] Assert model conversion only at load time: camera NHWC uint8→NCHW float32 `/255`; LiDAR uint8→leading channel float32 `/5`; status/trajectory remain float32; all shapes and finite values are checked.
 
 ```python
@@ -856,7 +943,8 @@ def assign_bag_splits(relative_paths):
 ```
 
 - [ ] Run `.venv-ros/bin/python -m pytest tests/unit/cache/test_manifest.py tests/unit/cache/test_loader.py tests/unit/cache/test_split.py -q`. Expected: FAIL.
-- [ ] Publish `manifests/{domain_id}/{resolved_domain_sha256}/manifest.jsonl` only after re-reading and verifying every per-bag artifact hash/count. Include eligible/excluded/rejected bag inventory, split, sample/drop counts, source paths/hashes, sidecar path/hash/count, source commit, resolved snapshot identity, and dirty override provenance.
+- [ ] Atomically publish one canonical epoch-safe TF/Ego diagnostic report per GT-rich bag before the manifest. It stores every `TfEgoGateProvenance` row sorted by raw Ego stable index plus the five counters and p99/max metric; the bag manifest binds its path/SHA-256 and repeats counters. Tests verify no-bracket/ambiguous/cross-exclusion rows, epoch/index/bracket provenance, report hash, and manifest counters. Never omit excluded rows or collapse all exclusions into one count.
+- [ ] Publish `manifests/{domain_id}/{resolved_domain_sha256}/manifest.jsonl` only after re-reading and verifying every per-bag artifact and diagnostic-report hash/count. Include eligible/excluded/rejected bag inventory, split, sample/drop counts, source paths/hashes, sidecar path/hash/count, source commit, resolved snapshot/lifecycle identity, epoch-safe diagnostic counters, and dirty override provenance.
 - [ ] Recompute current preset hash when loading but never reinterpret raw YAML/preset. Require artifact-bound `resolved-domain.json` and matching source hashes.
 - [ ] Run `.venv-ros/bin/python -m pytest tests/unit/cache/test_manifest.py tests/unit/cache/test_loader.py tests/unit/cache/test_split.py -q`, then `.venv-ros/bin/python -m pytest tests/unit -q`. Expected: both commands PASS.
 - [ ] Commit.
@@ -893,7 +981,7 @@ scripts/verify_cache.py --manifest PATH --sensor-preset PATH --report PATH [--co
 
 - [ ] Write CLI tests for missing resolved snapshot, wrong preset hash, `.bag.active` exclusion, 30 expected eligible/10 sensor-only classification, rejection report completion, default dirty-tree refusal, and development override provenance.
 - [ ] Build a fake bag-reader backend that exercises discovery→index→plan→materialize→HDF5/sidecar→manifest without ROS serialization. Assert two identical runs produce byte-identical canonical JSON/JSONL and tensor-equal HDF5 datasets.
-- [ ] Write `tests/unit/cli/test_verify_cache.py` for a read-only verification run over every manifest sample. Assert the atomically published canonical JSON report contains the manifest SHA-256, domain/snapshot/cache-schema identities, total and per-bag sample/drop/command counts, camera/LiDAR global min/max, separate side-camera Header-offset and sensor receipt-offset min/nearest-rank-p50/p95/max, trajectory-anchor TF receipt offsets and epoch counts/resets, maximum Ego/current/future native-Header bracket gaps, and per-bag full-stream native-Header TF/Ego position/heading p99. Hash every cache file before and after and assert verification mutates none.
+- [ ] Write `tests/unit/cli/test_verify_cache.py` for a read-only verification run over every manifest sample. Assert the atomically published canonical JSON report contains the manifest SHA-256, domain/snapshot/cache-schema/lifecycle identities, total and per-bag sample/drop/command counts, strict selected-front Header/index identity, camera/LiDAR global min/max, separate side-camera Header-offset and sensor receipt-offset p50/p95/max, raw trajectory-anchor TF receipt offsets and zero-based epoch counts/resets, independent Ego epoch counts/resets, maximum Ego/current/future native-Header bracket gaps, and per-bag epoch-safe full-stream TF/Ego p99 plus raw/comparable/no-bracket/ambiguous/cross-prevented counters. Re-read and hash-verify every diagnostic provenance report. Hash every cache file before and after and assert verification mutates none.
 - [ ] Add comparison cases using two independently verified manifests. Require identical resolved snapshot bytes, bag inventory, split assignment, sample IDs/order, sample/drop/command records, command sidecar bytes, and HDF5 dataset names/dtypes/shapes/values/attributes. If HDF5 container bytes differ, allow only the corresponding verified HDF5 file-hash fields to differ in manifest records; every other manifest field must match. Any semantic difference exits nonzero and no success report is published.
 - [ ] Make each thin script call its same-named `morai_ddv2.cli` module's `main`; all business logic remains importable. The batch preprocessor continues after bag-level failures to complete the rejection report, publishes no manifest if any expected eligible bag rejects, and exits nonzero. `verify_cache.py` passes `path=args.manifest`, `sensor_preset_path=args.sensor_preset`, `expected_domain_id="morai-ddv2-v1-oracle-command"`, `expected_resolved_domain_sha256=args.manifest.parent.name`, and `production=True` to `load_verified_manifest`, verifies every referenced row/sidecar identity, writes its report with the shared `.partial`/file-fsync/replace/parent-fsync helper, and never opens cache artifacts for writing.
 - [ ] Document the exact production commands.
@@ -922,7 +1010,7 @@ bash scripts/bootstrap_ros_env.sh
 
 - [ ] Run `.venv-ros/bin/python -m pytest tests/unit/cli/test_inspect_bags.py tests/unit/cli/test_preprocess_bags.py tests/unit/cli/test_verify_cache.py tests/integration/test_fake_bag_pipeline.py -q` before implementation. Expected: collection/import FAIL for the missing CLI modules.
 - [ ] Implement the three CLIs and thin scripts, then rerun `.venv-ros/bin/python -m pytest tests/unit/cli/test_inspect_bags.py tests/unit/cli/test_preprocess_bags.py tests/unit/cli/test_verify_cache.py tests/integration/test_fake_bag_pipeline.py -q`. Expected: PASS.
-- [ ] Run the opt-in real bag smoke against the smallest GT-rich bag. Assert at least one valid sample, exact tensor contracts, side Header/receipt, LiDAR/TF receipt, Ego/future Header and TF-epoch gates inside their separate tolerances, schema-v2 sidecar/status/provenance identity, and unchanged source size/mtime.
+- [ ] Run the opt-in real bag smoke against the smallest GT-rich bag. Assert at least one valid sample, exact tensor contracts, strict front identity, side Header/receipt, LiDAR/raw-TF receipt, independent Ego epoch and raw-anchor TF suffix gates, all 28 HDF5 datasets, exact repetition of the 24 non-tensor provenance values in the manifest, the 13-field sidecar/status identity, epoch-safe diagnostic counters/report hash, and unchanged source size/mtime.
 
 ```bash
 MORAI_REAL_BAG=/home/stier/rosbag/just_drive/s01-sensor-domain__morai__map-kcity__wx-clear__tod-day__scenario-000__20260731T170301KST.bag \
@@ -968,7 +1056,7 @@ git commit -m "feat: add deterministic MORAI preprocessing CLIs"
 
 - Production run has exactly 30 eligible finalized GT-rich bags, 10 `SENSOR_ONLY_EXCLUDED`, and every `.bag.active` excluded.
 - Split contains 24 train and 6 validation bags.
-- Every final schema-v2 manifest reference is hash-valid; each cached sample has exact dual-clock/TF-epoch provenance and a matching schema-v2 oracle-command sidecar record keyed by bag hash+front Header `timestamp_ns`.
+- Every final schema-v2 manifest reference is hash-valid; each HDF5 row has exactly 28 datasets, its manifest sample repeats exactly 24 non-tensor provenance values, and it has a matching 13-field schema-v2 oracle-command sidecar record keyed by bag hash+strictly increasing unique front Header `timestamp_ns`.
 
 - [ ] Start from a clean tracked tree and verify the sensor preset hash, submodule commits, ROS Python, free disk, and GPU-independent preprocessing dependencies.
 
@@ -1104,13 +1192,13 @@ Expected: every command exits 0. Record the printed digest and the verification-
 | Normative area | Implemented/tested in |
 |---|---|
 | Source hashes, MORAI Euler, resolved config | Tasks 1–2 |
-| Audited Option D axes, stable ties, dual-bound sides, TF epochs/brackets | Tasks 3, 8–9 |
-| Quaternion/SLERP, SE(2), TF/Ego p99 | Task 4 |
+| Audited Option D axes, stable ties, strict front identity, raw TF anchors, independent TF/Ego epochs/brackets | Tasks 3, 8–9 |
+| Quaternion/SLERP, SE(2), epoch-safe TF/Ego p99 and provenance | Tasks 4, 8 |
 | Mixed camera source sizes and final RGB tensor | Task 5 |
 | LiDAR extrinsic, 3D self-mask, histogram | Task 6 |
 | `[8,3]` target, command generation, status | Task 7 |
 | Topic/type/frame/resolution/extrinsic bag gates | Task 8 |
 | Sample drop and bag reject semantics | Tasks 8–9 |
-| Schema-v2 HDF5 dual-clock provenance and oracle-command sidecar | Task 10 |
+| 28-dataset schema-v2 HDF5, 24 repeated manifest provenance values, 13-field oracle-command sidecar | Tasks 10–11 |
 | Atomic manifest, deterministic 24/6 split, loader | Task 11 |
 | 30-bag execution and reproducibility | Tasks 12–13 |

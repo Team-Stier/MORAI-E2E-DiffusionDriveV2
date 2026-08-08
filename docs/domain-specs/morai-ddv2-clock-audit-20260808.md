@@ -9,7 +9,7 @@
 
 ## 1. 측정 방법
 
-각 sensor와 `/Ego_topic`, `/tf map -> base_link` record에서 native `Header.stamp`, rosbag receipt stamp와 stable read index를 수집했다. receipt seconds를 독립변수, Header seconds를 종속변수로 bag별 least-squares affine fit을 만들고 absolute residual의 nearest-rank p99를 계산했다.
+각 sensor와 `/Ego_topic`, `/tf map -> base_link` record에서 native `Header.stamp`, rosbag receipt stamp와 stable read index를 수집했다. receipt seconds를 독립변수, Header seconds를 종속변수로 bag별 least-squares affine fit을 만들었다. 이 감사 문서의 p99는 NumPy `quantile(q=0.99, method="higher")`다. production TF/Ego gate의 `ceil(0.99*N)-1` nearest-rank와 혼동하면 안 된다.
 
 표의 열은 다음 뜻이다.
 
@@ -77,27 +77,39 @@ A와 B의 아래 수치는 초기 Header-grid 실험이며 D의 receipt-grid cou
 
 A는 recorder observation time을 물리 상태축으로 사용해 170301에서 79 m/81° 오차를 만들었다. B는 일부 bag에서 맞지만 170301 selected-anchor position p99가 0.05 m gate를 넘고 TF fit residual p99가 0.981 s였다. 161756의 TF residual p99는 15.296 s여서 하나의 global affine mapping을 production 계약으로 사용할 수 없다.
 
-다음 표는 같은 receipt-grid 계열에서 C와 D를 비교한다. `C all/full`은 C의 all-sensor/full-horizon count다. `D camera/all/full`은 side dual-bound 통과, all-sensor+TF-anchor 통과, full-horizon count다. anchor p99는 선택 sample 진단이며 bag accept/reject gate는 마지막 두 열의 full-stream native-Header TF/Ego p99다.
+다음 표는 같은 receipt-grid 계열에서 C와 corrected production D를 비교한다. `C all/full`은 C의 all-sensor/full-horizon count다. D의 네 count는 차례로 side dual-bound camera, all-sensor, raw receipt-nearest TF anchor가 50 ms 안인 anchor, 선택한 raw TF anchor와 같은 zero-based epoch의 causal suffix만 사용한 full horizon이다. anchor p99도 이 corrected full-horizon 집합에서 계산했다.
 
-| Bag | Receipt grid | C all/full | D camera/all/full | D anchor p99 position m / heading deg | Native full-stream p99 position m / heading deg |
-|---|---:|---:|---:|---:|---:|
-| 141646 | 617 | 494 / 482 | 539 / 520 / 508 | 0.02982 / 0.03294 | 0.02770 / 0.03041 |
-| 161756 | 618 | 471 / 455 | 381 / 345 / 342 | 0.01303 / 0.02419 | 0.01550 / 0.02230 |
-| 170301 | 46 | 33 / 30 | 38 / 36 / 29 | 0.18675 / 0.04907 | 0.03275 / 0.03915 |
-| 181003 | 615 | 527 / 519 | 615 / 606 / 598 | 0.02357 / 0.02385 | 0.02151 / 0.02512 |
+| Bag | Receipt grid | C all/full | D camera / all-sensor / TF≤50 / full | Corrected D anchor p99 position m / heading deg |
+|---|---:|---:|---:|---:|
+| 141646 | 617 | 494 / 482 | 539 / 520 / 515 / 492 | 0.0353808394684 / 0.034837007722 |
+| 161756 | 618 | 471 / 455 | 381 / 345 / 345 / 338 | 0.0130304442505 / 0.024190896245 |
+| 170301 | 46 | 33 / 30 | 38 / 36 / 36 / 29 | 0.18674828178 / 0.0490711609214 |
+| 181003 | 615 | 527 / 519 | 615 / 606 / 606 / 583 | 0.0235719811199 / 0.0189487043202 |
 
-170301의 D anchor position p99는 29개 중 isolated outlier 하나 때문에 높다. 규범 bag gate는 sample-selected subset이 아니라 full-stream native-Header diagnostic이며 이 bag은 0.03275 m/0.03915°로 통과한다. isolated maximum은 report에 남기되 단독 reject 조건으로 사용하지 않는 기존 정책과 일치한다.
+이전 표의 full count 508/342/29/598은 future interpolation view를 만들 때 TF epoch 경계를 완전히 고정하지 않아 각각 16/4/0/15개 cross-epoch horizon을 잘못 허용했다. corrected count 492/338/29/583은 raw anchor stable index를 그대로 보존하고, 그 raw anchor부터 시작하는 same-epoch causal suffix 안에서 equivalent equal-Header duplicate만 collapse한 결과다.
+
+170301의 corrected D anchor position p99는 29개 중 isolated outlier 하나 때문에 높다. 규범 bag gate는 sample-selected subset이 아니라 아래 epoch-safe full-stream diagnostic이며 isolated maximum은 report에 남기되 단독 reject 조건으로 사용하지 않는다.
 
 TF receipt tolerance는 50 ms로 선택했다. 25 ms는 141646과 181003에서 각각 35개와 29개 valid anchor를 잃었고, 100 ms는 141646에서 5개만 추가하면서 더 먼 association을 허용했다.
 
-## 4. Production decision and limitations
+## 4. Corrected epoch and identity audits
+
+30개 bag의 selected front를 receipt-grid 순서로 검사했을 때 stable record 재사용 0건, Header 재사용 0건, non-increasing Header 0건이었다. 500 ms grid와 50 ms tolerance에서는 같은 front record가 두 grid에 선택될 수 없지만, `timestamp_ns`와 sample key의 identity를 보호하기 위해 production은 selected front Header의 strict 증가·유일성과 stable-record 미재사용을 명시적으로 검사한다.
+
+TF raw view는 `(receipt_stamp_ns, stable_record_index)` 순서의 모든 `map -> base_link` record를 보존한다. zero-based TF epoch는 raw Header strict decrease에서만 갈라진다. current anchor는 이 raw view에서 receipt-nearest로 선택하므로 equivalent same-Header duplicate여도 original stable index를 잃지 않는다. future view만 선택 raw anchor부터 시작하는 같은 epoch causal suffix를 만들고, 그 suffix 안에서 equivalent equal-Header를 earliest-at-or-after-anchor로 collapse한다. 154843에는 같은 native Header가 서로 다른 TF epoch에 한 번 재사용됐고 pose는 equivalent였다. epoch index가 disambiguate하므로 허용하며 duplicate conflict는 within-epoch에서만 판정한다.
+
+full-stream TF/Ego gate도 epoch-safe로 재감사했다. raw Ego 387,145개 각각에 receipt-nearest raw TF record를 붙여 TF epoch만 고른 뒤, 그 epoch-local collapsed TF Header view에서 Ego native Header를 최대 100 ms로 bracket했다. 기존 global Header view는 841/387,145개에서 다른 TF epoch를 골랐고 114개 bracket이 epoch 경계를 straddle했다. corrected epoch-local comparable pair는 386,438개였으며 30개 bag의 accept/reject 결과는 변하지 않았다. bag별 p99의 최대 변화는 position 0.000306 m, heading 0.000865°였다. production report는 raw Ego/selected TF epoch/bracket provenance와 no-bracket, ambiguous-epoch, cross-epoch-prevented counter를 분리한다.
+
+current Ego feature도 별도 raw Ego epoch가 필요하다. 30개 중 16개 bag에서 총 44개 Ego Header backstep/overlap이 있었다. 13,711개 TF anchor에서 global Ego Header view는 13,669개, receipt-nearest raw Ego가 고른 zero-based epoch-local view는 13,664개를 bracket했다. global 결과 중 8개가 epoch mismatch였으며 164630의 5개는 corrected contract에서 올바르게 drop된다. 나머지 3개는 source/value가 작게 바뀌었고 used feature component의 최대 absolute delta는 0.0006319193이었다. TF와 Ego epoch index는 서로 독립이며 cache는 둘 다 저장한다.
+
+## 5. Production decision and limitations
 
 Option D는 다음을 동시에 보존한다.
 
-1. recorder 관측 순서에서 sensor bundle과 local TF record를 association한다.
+1. recorder 관측 순서에서 sensor bundle과 raw local TF record를 association하고 current anchor의 original stable index를 보존한다.
 2. camera exposure는 native Header proximity를 요구하되 100 ms receipt sanity bound로 지연 queue의 잘못된 Header-nearest 후보를 막는다.
-3. current/future physics는 선택 TF의 native Header `T0`와 동일 receipt-order monotone TF clock epoch에 남는다.
+3. current TF는 selected raw record exact pose이고 future physics는 그 raw anchor의 same-epoch causal suffix에 남는다. Ego feature는 독립 Ego epoch 안에서만 `T0`를 bracket한다.
 4. LiDAR의 잦은 Header backstep을 sync 결정에 사용하지 않는다.
-5. full-stream TF/Ego native-Header diagnostic을 독립 bag gate로 유지한다.
+5. full-stream TF/Ego native-Header diagnostic도 receipt-nearest raw TF가 고른 epoch-local interpolation view만 사용한다.
 
-이 감사만으로 receipt stamp가 acquisition time임을 증명하지 않는다. 또한 표의 planning count는 최종 cache sample count가 아니다. production preprocessor는 JPEG decode/resolution, PointCloud layout, extrinsic, duplicate conflict, finite tensor 및 artifact identity gate를 추가로 적용해야 한다. 새 bag 또는 sensor clock behavior가 이 정책을 벗어나면 자동 affine 보정으로 숨기지 말고 새 domain version과 재감사를 요구한다.
+이 감사만으로 receipt stamp가 acquisition time임을 증명하지 않는다. 모든 표의 planning count는 최종 cache sample count가 아니다. production preprocessor는 JPEG decode/resolution, PointCloud layout, extrinsic, duplicate conflict, finite tensor 및 artifact identity gate를 추가로 적용해야 한다. `morai-ddv2-v1-oracle-command`는 아직 첫 production artifact를 publish하지 않은 pre-production domain이므로 이 정정을 같은 domain ID에 반영한다. 첫 production publication 뒤 clock policy 또는 cache schema가 바뀌면 기존 ID를 수정하지 말고 새 domain ID와 재감사를 요구한다.

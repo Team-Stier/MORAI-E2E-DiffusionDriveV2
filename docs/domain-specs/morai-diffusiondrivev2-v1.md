@@ -85,7 +85,7 @@ drop_on_required_sensor_miss: true
 
 `first_valid_front_receipt_ns`는 다른 sensor sync 결과와 무관하게 JPEG decode, Camera-1 frame 및 1280×720 resolution 검사를 통과한 front message 중 가장 작은 receipt nanosecond 값이다. 모든 grid, tolerance 및 offset 계산은 float seconds가 아니라 signed integer nanoseconds로 수행한다. 모든 tolerance 경계는 `abs(offset_ns) <= tolerance_ns`로 포함한다.
 
-2 Hz receipt grid마다 front는 `(abs(front_receipt-grid_receipt), front_receipt, stable_record_index)` 최소값을 50 ms 안에서 선택한다. 선택된 front의 `Header.stamp`는 `timestamp_ns`, receipt-grid target은 `grid_receipt_ns`다.
+2 Hz receipt grid마다 front는 `(abs(front_receipt-grid_receipt), front_receipt, stable_record_index)` 최소값을 50 ms 안에서 선택한다. 선택된 front의 `Header.stamp`는 `timestamp_ns`, receipt-grid target은 `grid_receipt_ns`다. receipt-grid 순서의 selected front Header는 strict하게 증가하고 유일해야 하며 selected front stable record도 재사용되면 안 된다. 500 ms period와 50 ms tolerance에서는 같은 record 재사용이 수학적으로 불가능하지만 구현은 세 조건을 모두 assert해야 한다. 하나라도 어기면 sample drop이나 `NO_VALID_SAMPLE`이 아니라 bag-level `FRONT_TIMESTAMP_ORDER_VIOLATION`이다. 30-bag audit에서는 세 위반 모두 0건이었다.
 
 left/right는 각각 후보 집합을 먼저 다음 두 inclusive 조건의 교집합으로 제한한다.
 
@@ -94,11 +94,15 @@ left/right는 각각 후보 집합을 먼저 다음 두 inclusive 조건의 교�
 
 그 뒤 `(abs(side_header-front_header), side_header, stable_record_index)` 최소값을 선택한다. receipt 조건을 통과하지 않은 Header-nearest frame으로 fallback하면 안 된다. LiDAR는 `(abs(lidar_receipt-front_receipt), lidar_receipt, stable_record_index)` 최소값을 45 ms 안에서 선택하며 LiDAR Header를 sync 결정에 사용하면 안 된다.
 
-`map -> base_link` trajectory anchor TF는 `(abs(tf_receipt-front_receipt), tf_receipt, stable_record_index)` 최소값을 50 ms 안에서 정확히 하나 선택한다. 두 번째 후보로 재선택하지 않는다. 선택한 record의 native Header를 `T0`로 삼고 그 TF pose를 current pose로 exact 사용한다. `/Ego_topic` velocity/acceleration은 native Header axis에서 `T0`를 bracket-only 보간한다.
+`map -> base_link` trajectory anchor TF는 duplicate를 collapse하지 않은 raw TF view에서 `(abs(tf_receipt-front_receipt), tf_receipt, stable_record_index)` 최소값을 50 ms 안에 정확히 하나 선택한다. 두 번째 후보로 재선택하지 않는다. equivalent same-Header duplicate여도 선택한 raw record의 original stable index를 보존하고, 그 native Header를 `T0`, pose를 exact current pose로 사용한다.
 
-TF clock epoch는 `map -> base_link` record를 `(receipt_stamp_ns, stable_record_index)` 순서로 읽었을 때 native Header가 nondecreasing인 maximal 구간이다. 이전 record보다 Header가 strict하게 작아지면 새 epoch를 시작한다. 같은 Header의 equivalent duplicate는 그 epoch 안에서 가장 이른 record만 남기고 conflict는 bag을 reject한다. future target은 `T0+0.5,...,T0+4.0 s`이며 선택 anchor부터 시작하는 동일 epoch의 receipt-order causal suffix 안에서만 Header bracket을 만든다. bracket gap은 100 ms 이하여야 하고 extrapolation, epoch/reset crossing 및 anchor 이전 record 재사용은 금지한다.
+zero-based TF clock epoch는 raw `map -> base_link` records를 `(receipt_stamp_ns, stable_record_index)` 순서로 읽어 native Header가 nondecreasing인 maximal 구간이다. 이전 raw record보다 Header가 strict하게 작아질 때만 다음 epoch를 시작한다. raw anchor view와 Header interpolation view는 별도 immutable view여야 하며 한 `poses` collection으로 모호하게 합치면 안 된다.
 
-`stable_record_index`는 camera/LiDAR/Ego topic message의 zero-based bag read order다. `/tf`에서는 모든 TFMessage 안의 TransformStamped를 message 순서대로 flatten한 zero-based order다. 동일 native Header의 `/Ego_topic` used fields는 값이 같은 duplicate를 가장 이른 record 하나로 collapse한다. Ego used fields의 finite float 값은 수치적으로 같아야 하며, TF duplicate는 translation 1e-6 m와 sign-invariant rotation angle 1e-6 rad 안에서 같아야 한다. 이를 넘는 conflicting duplicate는 bag을 reject한다.
+future target은 `T0+0.5,...,T0+4.0 s`다. interpolation view는 선택 raw anchor를 포함해 그 뒤에서 시작하는 same-epoch receipt-order causal suffix를 먼저 만든 뒤, suffix 안의 equivalent equal-Header duplicate만 earliest-at-or-after-anchor record로 collapse한다. 따라서 선택 anchor보다 앞선 duplicate가 current provenance나 future view를 대체할 수 없다. within-epoch conflict는 bag을 reject한다. 같은 native Header가 다른 TF epoch에 나타나는 것은 epoch index가 disambiguate하므로 허용하고 cross-epoch value conflict 검사를 적용하지 않는다. 154843에서 equivalent cross-epoch reuse가 1건 관측됐다. bracket gap은 100 ms 이하여야 하고 extrapolation, epoch/reset crossing, 다른 epoch fallback 및 anchor 이전 record 재사용은 금지한다.
+
+raw Ego도 `(receipt_stamp_ns, stable_record_index)` 순서의 strict Header decrease에서 zero-based independent clock epoch를 만든다. TF anchor receipt에 receipt-nearest raw Ego record를 `(abs(ego_receipt-tf_anchor_receipt), ego_receipt, stable_record_index)`로 선택해 Ego epoch만 결정한다. 이 epoch selector에는 receipt tolerance가 없으며 receipt axis에서 state를 보간하지 않는다. 선택 Ego epoch의 equivalent equal-Header를 earliest-in-epoch로 collapse한 Header view에서만 `T0`를 최대 100 ms로 bracket하며 다른 Ego epoch fallback은 금지한다. TF와 Ego epoch index는 서로 독립이다.
+
+`stable_record_index`는 camera/LiDAR/Ego topic message의 zero-based bag read order다. `/tf`에서는 모든 TFMessage 안의 TransformStamped를 message 순서대로 flatten한 zero-based order다. Ego used fields의 finite float 값은 동일 epoch·동일 Header에서 수치적으로 같아야 하고, TF duplicate는 같은 epoch·동일 Header에서 translation 1e-6 m와 sign-invariant rotation angle 1e-6 rad 안에서 같아야 한다. 이를 넘는 within-epoch conflict는 bag을 reject한다.
 
 ## 3. Raw ROS contract
 
@@ -165,11 +169,13 @@ extrinsic_rotation_tolerance_rad: 1.0e-4
 - `/Ego_topic` velocity/acceleration은 SI 단위의 `base_link` body-frame 값이며 회전 또는 scale 변환 없이 사용한다.
 - bag에는 rear-axle frame과 확정 차량 geometry가 없으므로 base_link-to-rear-axle 보정을 추정해서 적용하면 안 된다.
 
-current pose는 receipt-nearest로 선택한 trajectory-anchor TF 자체를 사용하고 Header/receipt/index bracket을 각각 `[T0,T0]`, `[R0,R0]`, `[i0,i0]`, weight를 0으로 기록한다. Ego와 future pose의 native Header 요청 시각과 동일한 source가 있으면 해당 source를 직접 사용하고 Header/receipt/index bracket의 양쪽을 같은 record로 기록한다. 그 외에는 허용된 source series에서 바로 이전 `t0`와 바로 다음 `t1`만 bracket으로 사용하고 `w=(t-t0)/(t1-t0)`로 계산한다. interpolation weight cache dtype은 float32다.
+current pose는 receipt-nearest raw trajectory-anchor TF 자체를 사용하고 Header/receipt/index bracket을 각각 `[T0,T0]`, `[R0,R0]`, `[i0,i0]`, weight를 0으로 기록한다. Ego와 future pose의 native Header 요청 시각과 동일한 selected-epoch interpolation source가 있으면 해당 source를 직접 사용하고 Header/receipt/index bracket의 양쪽을 같은 record로 기록한다. 그 외에는 위에서 허용한 epoch-local view에서 바로 이전 `t0`와 바로 다음 `t1`만 bracket으로 사용하고 `w=(t-t0)/(t1-t0)`로 계산한다. interpolation weight cache dtype은 float32다.
 
 TF translation은 양쪽 stamp 사이에서 선형 보간하고 rotation quaternion은 shortest-arc SLERP한다. `q0,q1`을 먼저 정규화하고 dot(q0,q1)<0이면 q1의 부호를 뒤집는다. 그 뒤 dot>0.9995면 normalized linear interpolation을, 아니면 SLERP를 적용하고 결과를 다시 정규화한다. `/Ego_topic` velocity/acceleration도 양쪽 stamp 사이에서 선형 보간한다. 모든 보간은 앞뒤 두 source가 있는 bracket 안에서만 허용하며 extrapolation은 금지한다. 현재 pose, future pose 및 Ego state 각각의 bracket 간격은 100 ms 이하여야 한다.
 
-sample selection과 별개로, full-stream `/Ego_topic` native Header마다 같은 native Header axis에서 canonical TF pose를 보간해 진단용 Ego XY 및 yaw와 비교한다. receipt-aligned pose 비교나 affine bridge 결과를 이 bag gate에 사용하면 안 된다. TF bracket을 만들 수 없는 bag 양끝 stamp는 진단 집합에서 제외하되 비교 가능한 pair가 10개 미만이면 bag을 거부한다. position error는 XY Euclidean distance, heading error는 degree-to-radian 변환 후 circular absolute difference다. 각 error를 오름차순 정렬하고 `ceil(0.99*N)-1` zero-based index를 택하는 nearest-rank p99가 다음 tolerance를 넘으면 해당 bag을 거부한다. isolated maximum은 report에 기록하되 단독 reject 조건으로 쓰지 않는다.
+sample selection과 별개로 full-stream epoch-safe TF/Ego gate를 수행한다. 각 raw Ego record에 receipt-nearest raw TF record를 `(abs(tf_receipt-ego_receipt), tf_receipt, stable_record_index)`로 하나 선택해 zero-based TF epoch만 결정한다. receipt tolerance나 다른 epoch fallback은 없다. Ego native Header는 선택 TF epoch의 epoch-local collapsed Header view에서만 최대 100 ms로 bracket해 진단용 Ego XY/yaw와 비교한다. receipt-aligned pose 비교, global Header view 또는 affine bridge 결과를 이 bag gate에 사용하면 안 된다.
+
+epoch-local bracket이 없거나 epoch association이 ambiguous하거나 global view라면 cross-epoch bracket이 되었을 record는 비교 집합에서 제외하고 각각 report한다. report는 raw Ego Header/receipt/index, 선택 raw TF index/epoch, bracket Header/receipt/index provenance와 `raw_ego_record_count`, `epoch_local_comparable_count`, `no_epoch_local_bracket_count`, `ambiguous_epoch_selection_count`, `cross_epoch_bracket_prevented_count`를 가진다. 비교 가능한 pair가 10개 미만이면 bag을 거부한다. position error는 XY Euclidean distance, heading error는 degree-to-radian 변환 후 circular absolute difference다. 각 error를 오름차순 정렬하고 `ceil(0.99*N)-1` zero-based index를 택하는 nearest-rank p99가 다음 tolerance를 넘으면 해당 bag을 거부한다. isolated maximum은 report에 기록하되 단독 reject 조건으로 쓰지 않는다.
 
 ~~~yaml
 tf_ego_position_p99_tolerance_m: 0.05
@@ -180,12 +186,12 @@ tf_ego_heading_p99_tolerance_deg: 0.5
 
 1. bag 시작 시 필수 topic, message type, frame 및 sensor preset을 검증한다.
 2. valid front receipt 범위에 2 Hz receipt grid를 만들고 grid마다 receipt-nearest front를 50 ms 안에서 선택한다.
-3. 선택한 front Header를 sample `timestamp_ns`, grid target을 `grid_receipt_ns`로 사용한다.
+3. receipt-grid order의 selected front Header strict 증가·유일성과 stable record 미재사용을 bag gate로 검증한 뒤 front Header를 `timestamp_ns`, grid target을 `grid_receipt_ns`로 사용한다.
 4. left/right는 Header 30 ms와 receipt 100 ms dual-filter 뒤 Header tie로 선택한다.
 5. LiDAR는 front receipt 기준 45 ms 안에서 receipt-nearest로 선택한다.
-6. `map -> base_link` TF는 front receipt 기준 50 ms 안에서 receipt-nearest로 하나 선택하고 그 native Header `T0`의 pose를 current pose로 exact 사용한다.
-7. `/Ego_topic` velocity/acceleration은 native Header `T0`에 bracket-only 선형 보간한다.
-8. 선택 TF와 같은 receipt-order monotone TF clock epoch의 causal suffix에서 native Header `T0+0.5,...,T0+4.0 s`를 translation 선형 보간과 quaternion SLERP로 보간한다.
+6. raw `map -> base_link` TF view에서 front receipt 기준 50 ms 안의 receipt-nearest raw record 하나를 선택하고 original index를 보존한 채 native Header `T0`의 pose를 current pose로 exact 사용한다.
+7. TF anchor receipt-nearest raw Ego가 고른 independent zero-based Ego epoch에서만 native Header `T0`의 velocity/acceleration을 bracket-only 선형 보간한다.
+8. 선택 raw TF anchor부터 시작하는 same-epoch causal suffix interpolation view에서만 native Header `T0+0.5,...,T0+4.0 s`를 translation 선형 보간과 quaternion SLERP로 보간한다.
 9. 어느 필수 값이라도 없거나 비유한 값이면 sample을 생성하지 않는다.
 
 한 raw 메시지는 여러 anchor에 재사용할 수 있지만 sample metadata에는 실제 Header, receipt와 stable record index를 모두 기록해야 한다. Ego 또는 future-pose bracket 간격이 100 ms를 넘으면 sample을 drop해야 한다. source 앞이나 뒤로 extrapolation하거나 TF clock epoch/reset을 넘으면 안 된다. nearest 후보가 이후 validation을 통과하지 못해도 두 번째 후보를 고르는 fallback은 금지한다.
@@ -397,7 +403,9 @@ path length는 `p0=(0,0)`, `p1..p8=trajectory[:,0:2]`에 대해 `sum(i=1..8, ||p
 
 cache/manifest/command-sidecar schema version은 2다. resolved-domain root schema는 1을 유지할 수 있지만 resolved-domain hash는 clock policy와 cache schema 변경으로 반드시 바뀐다.
 
-bag 하나는 cache root 기준 `bags/<domain_id>/<resolved_domain_sha256>/<source_bag_sha256>.h5` 하나로 직렬화한다. sample ID는 lowercase bag SHA-256, colon, unsigned decimal selected-front Header를 연결한 `<source_bag_sha256>:<timestamp_ns>`이며 dataset 전체에서 유일해야 한다. `timestamp_ns`는 selected front Header이고 `grid_receipt_ns`나 callback time으로 대체하면 안 된다.
+bag 하나는 cache root 기준 `bags/<domain_id>/<resolved_domain_sha256>/<source_bag_sha256>.h5` 하나로 직렬화한다. sample ID는 lowercase bag SHA-256, colon, unsigned decimal selected-front Header를 연결한 `<source_bag_sha256>:<timestamp_ns>`이며 dataset 전체에서 유일해야 한다. `timestamp_ns`는 selected front Header이고 `grid_receipt_ns`나 callback time으로 대체하면 안 된다. HDF5 row와 sidecar를 쓰기 전에 receipt-grid 순서의 `timestamp_ns` strict 증가·유일성과 front stable-index 미재사용 bag gate가 완료되어야 한다.
+
+필수 HDF5 dataset은 정확히 28개다.
 
 | Dataset | dtype | Shape |
 |---|---|---|
@@ -416,6 +424,7 @@ bag 하나는 cache root 기준 `bags/<domain_id>/<resolved_domain_sha256>/<sour
 | trajectory_anchor_tf_receipt_ns | int64 | [N] |
 | trajectory_anchor_tf_record_index | int64 | [N] |
 | trajectory_anchor_tf_clock_epoch_index | int64 | [N] |
+| ego_bracket_clock_epoch_index | int64 | [N] |
 | ego_bracket_header_stamp_ns | int64 | [N,2] |
 | ego_bracket_receipt_ns | int64 | [N,2] |
 | ego_bracket_record_index | int64 | [N,2] |
@@ -431,11 +440,11 @@ bag 하나는 cache root 기준 `bags/<domain_id>/<resolved_domain_sha256>/<sour
 
 sensor source Header/receipt/index의 마지막 축 순서는 front, left, right, lidar다. `side_camera_header_offset_ns`는 left/right Header에서 selected-front Header를 뺀 `[left,right]` signed nanosecond다. LiDAR Header는 provenance로만 저장하며 sync offset 의미를 부여하지 않는다. `sensor_receipt_offset_ns`는 left/right/lidar receipt에서 selected-front receipt를 뺀 `[left,right,lidar]` signed nanosecond다. 서로 다른 clock axis를 한 offset dataset에 섞으면 안 된다.
 
-`trajectory_anchor_tf_*`는 receipt-nearest로 선택한 exact current TF를 가리킨다. 따라서 `current_pose_bracket_*`는 Header `[T0,T0]`, receipt `[R0,R0]`, index `[i0,i0]`, weight `0`이어야 한다. bracket record index는 duplicate collapse 뒤 선택된 원본 stable record를 가리킨다. 각 interpolation weight는 native Header axis의 `t=(1-w)*t0+w*t1`에서 계산한 `w`이며 범위는 [0,1]이다. receipt bracket은 같은 두 source record의 receipt provenance이지 weight 계산 axis가 아니다.
+`trajectory_anchor_tf_*`는 raw TF view에서 receipt-nearest로 선택한 exact current record를 가리키며 duplicate collapse가 original stable index를 바꾸면 안 된다. 따라서 `current_pose_bracket_*`는 Header `[T0,T0]`, receipt `[R0,R0]`, index `[i0,i0]`, weight `0`이어야 한다. `ego_bracket_clock_epoch_index`는 TF epoch가 아니라 receipt-nearest raw Ego record가 고른 independent zero-based Ego epoch다. Ego/future bracket record index는 해당 selected-epoch interpolation view가 선택한 원본 stable record를 가리킨다. 각 interpolation weight는 native Header axis의 `t=(1-w)*t0+w*t1`에서 계산한 `w`이며 범위는 [0,1]이다. receipt bracket은 같은 두 source record의 receipt provenance이지 weight 계산 axis가 아니다.
 
-command sidecar 경로는 cache root 기준 `commands/<domain_id>/<resolved_domain_sha256>/<source_bag_sha256>.jsonl`이다. `.partial` 파일에 쓴 뒤 fsync하고 원자적으로 rename한다. record는 `timestamp_ns` 오름차순이고 timestamp가 중복되면 안 된다. 각 record는 `schema_version=2`, `domain_id`, `resolved_domain_sha256`, `sensor_preset_sha256`, `source_bag_sha256`, `command_rule_sha256`, `timestamp_ns`, `grid_receipt_ns`, `front_receipt_ns`, `front_record_index`, `command_index`, `command_name`, `provenance=future_trajectory_oracle`을 가진다. lookup key는 계속 `(source_bag_sha256,timestamp_ns)`이고 receipt를 key로 바꾸면 안 된다. index mapping은 LEFT=0, STRAIGHT=1, RIGHT=2, UNKNOWN=3이며 같은 값은 `status[:,0:4]`와 exact하게 일치해야 한다.
+command sidecar 경로는 cache root 기준 `commands/<domain_id>/<resolved_domain_sha256>/<source_bag_sha256>.jsonl`이다. `.partial` 파일에 쓴 뒤 fsync하고 원자적으로 rename한다. record는 `timestamp_ns` 오름차순이고 timestamp가 중복되면 안 된다. 각 13-field record는 `schema_version=2`, `domain_id`, `resolved_domain_sha256`, `sensor_preset_sha256`, `source_bag_sha256`, `command_rule_sha256`, `timestamp_ns`, `grid_receipt_ns`, `front_receipt_ns`, `front_record_index`, `command_index`, `command_name`, `provenance=future_trajectory_oracle`을 가진다. lookup key는 계속 `(source_bag_sha256,timestamp_ns)`이고 receipt를 key로 바꾸면 안 된다. index mapping은 LEFT=0, STRAIGHT=1, RIGHT=2, UNKNOWN=3이며 같은 값은 `status[:,0:4]`와 exact하게 일치해야 한다.
 
-schema-v2 manifest의 각 `sample` record는 위 HDF5 provenance field 전부를 같은 이름, 축 순서 및 값으로 반복하고 `hdf5_row_index`, `sidecar_row_index`와 artifact identity를 추가한다. manifest가 HDF5와 다른 clock axis, source index 또는 interpolation bracket을 기록하면 전체 artifact를 reject한다. `dataset` record의 `schema_version`도 2이며 loader는 schema 1과 2를 암묵적으로 혼용하거나 field 이름을 추측해 migration하면 안 된다.
+schema-v2 manifest의 각 `sample` record는 28 HDF5 datasets 중 네 tensor dataset을 제외한 24 provenance values를 같은 이름, 축 순서 및 값으로 반복하고 `hdf5_row_index`, `sidecar_row_index`와 artifact identity를 추가한다. tensor payload를 JSONL에 복제하면 안 된다. manifest가 HDF5와 다른 clock axis, source index 또는 interpolation bracket을 기록하면 전체 artifact를 reject한다. `dataset` record의 `schema_version`도 2이며 loader는 schema 1과 2를 암묵적으로 혼용하거나 field 이름을 추측해 migration하면 안 된다.
 
 `command_rule_sha256`은 resolved-domain.json에 기록된 command mapping, threshold와 분류 순서를 canonical JSON으로 직렬화한 SHA-256이다. 전체 manifest는 완성 sidecar의 상대경로, record count와 파일 SHA-256을 저장한다. Validator는 namespace, 모든 identity field, record count 및 sidecar SHA-256을 추론 전에 검증해야 한다.
 
@@ -493,6 +502,7 @@ RESOLUTION_MISMATCH
 EXTRINSIC_MISMATCH
 TF_EGO_POSE_MISMATCH
 DUPLICATE_STATE_CONFLICT
+FRONT_TIMESTAMP_ORDER_VIOLATION
 NO_VALID_SAMPLE
 ~~~
 
@@ -607,12 +617,16 @@ domain 구현은 다음 검사를 통과해야 한다.
 11. export checkpoint가 V2 SEL runtime에서 strict load
 12. 모델 출력이 finite [8,3]
 13. Header-nearest side 1순위가 receipt 100 ms를 위반하고 2순위가 dual-bound를 만족하면 2순위를 선택
-14. TF native Header backstep에서 새 epoch를 만들고 future bracket이 reset을 넘지 않음
-15. offline과 Validator가 manifest stable index/bracket을 replay하며 callback time으로 재선택하지 않음
+14. raw TF native Header backstep에서 zero-based epoch를 만들고 selected raw anchor의 same-epoch causal suffix만 future interpolation view로 사용
+15. equivalent same-Header raw TF anchor의 original stable index가 current provenance에 남고 suffix collapse가 anchor 이전 duplicate를 선택하지 않음
+16. current Ego epoch는 anchor receipt-nearest raw Ego로 독립 선택되며 다른 epoch의 더 가까운 Header를 사용하지 않음
+17. full-stream TF/Ego gate가 receipt-nearest raw TF의 epoch-local view만 쓰고 no-bracket/ambiguous/cross counter와 provenance를 기록
+18. selected front Header가 non-increasing/duplicate이거나 front record가 재사용되면 `FRONT_TIMESTAMP_ORDER_VIOLATION`
+19. offline과 Validator가 manifest stable index/TF·Ego epoch/bracket을 replay하며 callback time으로 재선택하지 않음
 
 ## 16. Versioning rule
 
-다음 중 하나라도 바뀌면 domain ID를 올리고 cache를 다시 생성해야 한다.
+`morai-ddv2-v1-oracle-command`는 이 문서 시점에 첫 production cache/checkpoint/Validator artifact가 아직 publish되지 않은 pre-production domain이다. 따라서 2026-08-08 corrected audit 계약은 같은 ID의 첫 publication 전에 반영한다. 첫 production publication이 일어난 뒤에는 다음 중 하나라도 바뀌면 기존 ID를 수정하지 않고 새 domain ID를 발급해 cache를 다시 생성해야 한다.
 
 - sensor preset 또는 hash
 - topic/frame mapping
