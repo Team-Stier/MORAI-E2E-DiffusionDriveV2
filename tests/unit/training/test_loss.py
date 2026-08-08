@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import json
 import math
+import os
+import subprocess
+import sys
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 import torch
 from torch import nn
-from torch.nn import functional as F
 
 from morai_ddv2.training.contracts import FreezeManifest, TrainingBoundaryError
 from morai_ddv2.training.loss import (
@@ -91,6 +95,27 @@ def test_snapshot_contains_only_detached_fp32_device_clones() -> None:
     assert torch.equal(reference[manifest.trainable_parameters[0]], torch.zeros(1))
 
 
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+def test_snapshot_rejects_nonfinite_source_parameters(value: float) -> None:
+    model = _LossModel()
+    manifest = _manifest(model)
+    parameter = dict(model.named_parameters())[manifest.trainable_parameters[0]]
+    parameter.data.fill_(value)
+
+    with pytest.raises(TrainingBoundaryError, match="source parameter.*finite"):
+        snapshot_source_parameters(model, manifest)
+
+
+def test_snapshot_rejects_nonfinite_fp32_clone_after_conversion() -> None:
+    model = _LossModel(dtype=torch.float64)
+    manifest = _manifest(model)
+    parameter = dict(model.named_parameters())[manifest.trainable_parameters[0]]
+    parameter.data.fill_(torch.finfo(torch.float64).max)
+
+    with pytest.raises(TrainingBoundaryError, match="source parameter.*finite"):
+        snapshot_source_parameters(model, manifest)
+
+
 def test_preservation_uses_one_global_scalar_count_for_unequal_tensors() -> None:
     model = _LossModel()
     manifest = _manifest(model)
@@ -106,6 +131,55 @@ def test_preservation_uses_one_global_scalar_count_for_unequal_tensors() -> None
     assert preservation.dtype is torch.float32
     torch.testing.assert_close(preservation, torch.tensor(7.0 / 4.0), rtol=0, atol=0)
     assert preservation.item() != 5.0 / 2.0
+
+
+@pytest.mark.parametrize("location", ["current", "reference"])
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+def test_preservation_rejects_nonfinite_inputs(location: str, value: float) -> None:
+    model = _LossModel()
+    manifest = _manifest(model)
+    reference = dict(snapshot_source_parameters(model, manifest))
+    first = manifest.trainable_parameters[0]
+    if location == "current":
+        dict(model.named_parameters())[first].data.fill_(value)
+    else:
+        reference[first].fill_(value)
+
+    with pytest.raises(TrainingBoundaryError, match=f"{location}.*finite"):
+        source_preservation_loss(model, reference, manifest)
+
+
+def test_preservation_rejects_nonfinite_component_from_fp32_overflow() -> None:
+    model = _LossModel()
+    manifest = _manifest(model)
+    reference = snapshot_source_parameters(model, manifest)
+    first = manifest.trainable_parameters[0]
+    dict(model.named_parameters())[first].data.fill_(torch.finfo(torch.float32).max)
+
+    with pytest.raises(TrainingBoundaryError, match="preservation loss.*finite"):
+        source_preservation_loss(model, reference, manifest)
+
+
+def test_preservation_finite_checks_use_constant_host_synchronizations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _LossModel()
+    manifest = _manifest(model)
+    reference = snapshot_source_parameters(model, manifest)
+    original_item = torch.Tensor.item
+    item_calls = 0
+
+    def counted_item(tensor: torch.Tensor):
+        nonlocal item_calls
+        item_calls += 1
+        return original_item(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "item", counted_item)
+
+    preservation = source_preservation_loss(model, reference, manifest)
+
+    assert preservation.item() == 0.0
+    assert item_calls - 1 == 3
 
 
 def test_composite_is_exact_fp32_and_retains_the_backward_graph() -> None:
@@ -208,14 +282,118 @@ def test_compose_rejects_mutated_outer_weights_even_without_preflight() -> None:
         )
 
 
-def test_heading_regression_is_raw_l1_across_pi_boundary() -> None:
-    predicted = torch.tensor(math.pi - 0.01)
-    target = torch.tensor(-math.pi + 0.01)
+def test_compose_requires_zero_dimensional_trajectory_loss() -> None:
+    model = _LossModel()
+    manifest = _manifest(model)
+    reference = snapshot_source_parameters(model, manifest)
 
-    raw_heading_l1 = F.l1_loss(predicted, target)
+    with pytest.raises(TrainingBoundaryError, match="zero-dimensional"):
+        compose_finetune_loss(torch.ones(1), model, reference, manifest)
 
-    assert raw_heading_l1.item() == pytest.approx(2.0 * math.pi - 0.02)
-    assert raw_heading_l1.item() > 6.0
+
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+def test_compose_rejects_nonfinite_trajectory_component(value: float) -> None:
+    model = _LossModel()
+    manifest = _manifest(model)
+    reference = snapshot_source_parameters(model, manifest)
+
+    with pytest.raises(TrainingBoundaryError, match="trajectory loss.*finite"):
+        compose_finetune_loss(torch.tensor(value), model, reference, manifest)
+
+
+def test_compose_rejects_nonfinite_total_from_fp32_overflow() -> None:
+    model = _LossModel()
+    manifest = _manifest(model)
+    reference = snapshot_source_parameters(model, manifest)
+    trajectory = torch.tensor(torch.finfo(torch.float32).max / 2.0)
+
+    with pytest.raises(TrainingBoundaryError, match="total loss.*finite"):
+        compose_finetune_loss(trajectory, model, reference, manifest)
+
+
+def test_pinned_loss_computer_uses_raw_heading_l1_across_pi_boundary(
+    repo_root: Path,
+) -> None:
+    checkout = repo_root / "third_party/DiffusionDriveV2"
+    source = checkout / "navsim/agents/diffusiondrivev2/modules/multimodal_loss.py"
+    if not source.is_file():
+        result = subprocess.run(
+            ["git", "rev-parse", "--git-common-dir"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        common_dir = Path(result.stdout.strip())
+        if not common_dir.is_absolute():
+            common_dir = (repo_root / common_dir).resolve()
+        checkout = common_dir.parent / "third_party/DiffusionDriveV2"
+        source = checkout / "navsim/agents/diffusiondrivev2/modules/multimodal_loss.py"
+    assert source.is_file()
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=checkout,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert commit == "1cd12a1e155c34dcc471261835444c8d5587580b"
+    code = """
+import json
+import math
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import torch
+from navsim.agents.diffusiondrivev2.modules import multimodal_loss
+
+source = Path(sys.argv[1]).resolve()
+assert Path(multimodal_loss.__file__).resolve() == source
+config = SimpleNamespace(trajectory_cls_weight=10.0, trajectory_reg_weight=8.0)
+loss_computer = multimodal_loss.LossComputer(config)
+assert loss_computer.cls_loss_weight == 10.0
+assert loss_computer.reg_loss_weight == 8.0
+predicted = torch.tensor([[[[0.0, 0.0, math.pi - 0.01]]]])
+target = torch.tensor([[[0.0, 0.0, -math.pi + 0.01]]])
+logits = torch.zeros((1, 1))
+plan_anchor = torch.zeros((1, 1, 1, 2))
+trajectory_loss = loss_computer(
+    predicted, logits, {"trajectory": target}, plan_anchor
+)
+classification = 10.0 * multimodal_loss.py_sigmoid_focal_loss(
+    logits,
+    torch.ones_like(logits),
+    weight=None,
+    gamma=2.0,
+    alpha=0.25,
+    reduction="mean",
+    avg_factor=None,
+)
+observed_heading_l1 = (trajectory_loss - classification) * 3.0 / 8.0
+print(json.dumps({
+    "module_path": str(Path(multimodal_loss.__file__).resolve()),
+    "observed_heading_l1": observed_heading_l1.item(),
+}))
+"""
+    env = os.environ.copy()
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PYTHONPATH"] = os.pathsep.join((str(checkout), env.get("PYTHONPATH", "")))
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", code, str(source)],
+        cwd=repo_root,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    observed = json.loads(result.stdout)
+
+    assert Path(observed["module_path"]) == source.resolve()
+    assert observed["observed_heading_l1"] == pytest.approx(
+        2.0 * math.pi - 0.02, abs=1.0e-6
+    )
+    assert observed["observed_heading_l1"] > 6.0
 
 
 @pytest.mark.parametrize("operation", ["snapshot", "preservation"])

@@ -17,6 +17,11 @@ class FinetuneLoss:
     preservation: torch.Tensor
 
 
+def _require_finite(tensor: torch.Tensor, label: str) -> None:
+    if not torch.isfinite(tensor).all().item():
+        raise TrainingBoundaryError(f"{label} must be finite")
+
+
 def snapshot_source_parameters(
     model: nn.Module, manifest: FreezeManifest
 ) -> Mapping[str, torch.Tensor]:
@@ -32,13 +37,12 @@ def snapshot_source_parameters(
     if unknown:
         raise TrainingBoundaryError(f"unknown trainable parameter: {unknown}")
 
-    return OrderedDict(
-        (
-            name,
-            named_parameters[name].detach().to(dtype=torch.float32).clone(),
-        )
-        for name in manifest.trainable_parameters
-    )
+    reference = OrderedDict()
+    for name in manifest.trainable_parameters:
+        baseline = named_parameters[name].detach().to(dtype=torch.float32).clone()
+        _require_finite(baseline, f"source parameter {name}")
+        reference[name] = baseline
+    return reference
 
 
 def source_preservation_loss(
@@ -64,6 +68,8 @@ def source_preservation_loss(
 
     first = named_parameters[manifest.trainable_parameters[0]]
     numerator = torch.zeros((), dtype=torch.float32, device=first.device)
+    current_finite = torch.ones((), dtype=torch.bool, device=first.device)
+    reference_finite = torch.ones((), dtype=torch.bool, device=first.device)
     denominator = 0
     for name in manifest.trainable_parameters:
         current = named_parameters[name]
@@ -82,12 +88,20 @@ def source_preservation_loss(
             raise TrainingBoundaryError(f"source reference must be detached: {name}")
         if current.device != numerator.device:
             raise TrainingBoundaryError("trainable parameters span multiple devices")
+        current_finite = current_finite & torch.isfinite(current).all()
+        reference_finite = reference_finite & torch.isfinite(baseline).all()
         numerator = numerator + (current.float() - baseline).square().sum()
         denominator += current.numel()
 
+    if not current_finite.item():
+        raise TrainingBoundaryError("current trainable parameters must be finite")
+    if not reference_finite.item():
+        raise TrainingBoundaryError("source reference parameters must be finite")
     if denominator == 0:
         raise TrainingBoundaryError("no trainable parameter scalars")
-    return numerator / denominator
+    preservation = numerator / denominator
+    _require_finite(preservation, "preservation loss")
+    return preservation
 
 
 def compose_finetune_loss(
@@ -105,16 +119,18 @@ def compose_finetune_loss(
         raise TrainingBoundaryError("preservation loss weight must be exactly 1.0e-3")
     if not isinstance(trajectory_loss, torch.Tensor):
         raise TrainingBoundaryError("trajectory loss must be a tensor")
-    if trajectory_loss.numel() != 1:
-        raise TrainingBoundaryError("trajectory loss must be scalar")
+    if trajectory_loss.ndim != 0:
+        raise TrainingBoundaryError("trajectory loss must be zero-dimensional")
 
-    trajectory = trajectory_loss.float().reshape(())
+    trajectory = trajectory_loss.float()
+    _require_finite(trajectory, "trajectory loss")
     preservation = source_preservation_loss(model, reference, manifest)
     if trajectory.device != preservation.device:
         raise TrainingBoundaryError(
             "trajectory and preservation losses must share one device"
         )
     total = 12.0 * trajectory + 1.0e-3 * preservation
+    _require_finite(total, "total loss")
     return FinetuneLoss(total, trajectory, preservation)
 
 
