@@ -135,6 +135,79 @@ def _ego_values(value: EgoDiagnosticValue) -> Tuple[np.ndarray, float]:
     return position, heading_deg
 
 
+def aggregate_tf_ego_errors(
+    position_errors_m: Sequence[float],
+    heading_errors_deg: Sequence[float],
+    excluded_count: int,
+    *,
+    minimum_comparable_pairs: int = 10,
+    position_p99_tolerance_m: float = 0.05,
+    heading_p99_tolerance_deg: float = 0.5,
+) -> TfEgoDiagnostic:
+    """Aggregate already epoch-selected TF/Ego errors under the shared gate."""
+
+    (
+        _,
+        minimum_pairs,
+        position_tolerance,
+        heading_tolerance,
+    ) = _validated_policy(
+        0,
+        minimum_comparable_pairs,
+        position_p99_tolerance_m,
+        heading_p99_tolerance_deg,
+    )
+    if not isinstance(excluded_count, int) or isinstance(excluded_count, bool):
+        raise TypeError("excluded_count must be an integer")
+    if excluded_count < 0:
+        raise ValueError("excluded_count must be non-negative")
+    try:
+        positions = np.asarray(position_errors_m, dtype=np.float64)
+        headings = np.asarray(heading_errors_deg, dtype=np.float64)
+    except (TypeError, ValueError) as error:
+        raise ValueError("TF/Ego errors must contain numeric values") from error
+    if positions.ndim != 1 or headings.ndim != 1:
+        raise ValueError("TF/Ego errors must be one-dimensional sequences")
+    if positions.size != headings.size:
+        raise ValueError("TF/Ego position and heading error counts must match")
+    if not np.isfinite(positions).all() or not np.isfinite(headings).all():
+        raise ValueError("TF/Ego errors must contain only finite values")
+    if np.any(positions < 0.0) or np.any(headings < 0.0):
+        raise ValueError("TF/Ego errors must be non-negative")
+
+    comparable_count = int(positions.size)
+    if comparable_count < minimum_pairs:
+        raise TfEgoPoseMismatch(
+            "TF/Ego comparable pair count {} is below minimum {}".format(
+                comparable_count, minimum_pairs
+            )
+        )
+
+    diagnostic = TfEgoDiagnostic(
+        comparable_count=comparable_count,
+        excluded_count=excluded_count,
+        position_p99_m=nearest_rank_percentile(positions, 0.99),
+        position_max_m=float(np.max(positions)),
+        heading_p99_deg=nearest_rank_percentile(headings, 0.99),
+        heading_max_deg=float(np.max(headings)),
+    )
+    if diagnostic.position_p99_m > position_tolerance:
+        raise TfEgoPoseMismatch(
+            "TF/Ego position p99 {} m exceeds tolerance {} m".format(
+                diagnostic.position_p99_m, position_tolerance
+            ),
+            diagnostic=diagnostic,
+        )
+    if diagnostic.heading_p99_deg > heading_tolerance:
+        raise TfEgoPoseMismatch(
+            "TF/Ego heading p99 {} deg exceeds tolerance {} deg".format(
+                diagnostic.heading_p99_deg, heading_tolerance
+            ),
+            diagnostic=diagnostic,
+        )
+    return diagnostic
+
+
 def compute_tf_ego_diagnostic(
     ego_records: Sequence[StampedRecord[EgoDiagnosticValue]],
     tf_records: Sequence[StampedRecord[Pose]],
@@ -185,34 +258,11 @@ def compute_tf_ego_diagnostic(
         circular_error_rad = abs(_wrap_to_pi(ego_heading_rad - tf_heading_rad))
         heading_errors_deg.append(float(math.degrees(circular_error_rad)))
 
-    comparable_count = len(position_errors)
-    if comparable_count < minimum_pairs:
-        raise TfEgoPoseMismatch(
-            "TF/Ego comparable pair count {} is below minimum {}".format(
-                comparable_count, minimum_pairs
-            )
-        )
-
-    diagnostic = TfEgoDiagnostic(
-        comparable_count=comparable_count,
+    return aggregate_tf_ego_errors(
+        position_errors_m=position_errors,
+        heading_errors_deg=heading_errors_deg,
         excluded_count=excluded_count,
-        position_p99_m=nearest_rank_percentile(position_errors, 0.99),
-        position_max_m=float(max(position_errors)),
-        heading_p99_deg=nearest_rank_percentile(heading_errors_deg, 0.99),
-        heading_max_deg=float(max(heading_errors_deg)),
+        minimum_comparable_pairs=minimum_pairs,
+        position_p99_tolerance_m=position_tolerance,
+        heading_p99_tolerance_deg=heading_tolerance,
     )
-    if diagnostic.position_p99_m > position_tolerance:
-        raise TfEgoPoseMismatch(
-            "TF/Ego position p99 {} m exceeds tolerance {} m".format(
-                diagnostic.position_p99_m, position_tolerance
-            ),
-            diagnostic=diagnostic,
-        )
-    if diagnostic.heading_p99_deg > heading_tolerance:
-        raise TfEgoPoseMismatch(
-            "TF/Ego heading p99 {} deg exceeds tolerance {} deg".format(
-                diagnostic.heading_p99_deg, heading_tolerance
-            ),
-            diagnostic=diagnostic,
-        )
-    return diagnostic

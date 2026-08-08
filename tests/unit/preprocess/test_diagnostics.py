@@ -9,6 +9,7 @@ from morai_ddv2.preprocess.diagnostics import (
     EgoDiagnosticValue,
     TfEgoDiagnostic,
     TfEgoPoseMismatch,
+    aggregate_tf_ego_errors,
     compute_tf_ego_diagnostic,
     nearest_rank_percentile,
 )
@@ -91,6 +92,75 @@ def test_diagnostic_value_and_result_are_immutable() -> None:
         value.heading_deg = 4.0
     with pytest.raises(FrozenInstanceError):
         result.comparable_count = 11
+
+
+def test_pure_error_aggregation_preserves_p99_and_isolated_max_contract() -> None:
+    actual = aggregate_tf_ego_errors(
+        position_errors_m=(0.0,) * 99 + (1.0,),
+        heading_errors_deg=(0.0,) * 99 + (10.0,),
+        excluded_count=7,
+        minimum_comparable_pairs=10,
+        position_p99_tolerance_m=0.05,
+        heading_p99_tolerance_deg=0.5,
+    )
+
+    assert actual == TfEgoDiagnostic(
+        comparable_count=100,
+        excluded_count=7,
+        position_p99_m=0.0,
+        position_max_m=1.0,
+        heading_p99_deg=0.0,
+        heading_max_deg=10.0,
+    )
+
+
+def test_pure_error_aggregation_uses_inclusive_tolerances_and_attaches_metric() -> None:
+    at_limit = aggregate_tf_ego_errors(
+        position_errors_m=(0.05,) * 10,
+        heading_errors_deg=(0.5,) * 10,
+        excluded_count=0,
+    )
+
+    assert at_limit.position_p99_m == pytest.approx(0.05)
+    assert at_limit.heading_p99_deg == pytest.approx(0.5)
+    with pytest.raises(TfEgoPoseMismatch) as caught:
+        aggregate_tf_ego_errors(
+            position_errors_m=(0.050001,) * 10,
+            heading_errors_deg=(0.0,) * 10,
+            excluded_count=2,
+        )
+    assert caught.value.diagnostic is not None
+    assert caught.value.diagnostic.excluded_count == 2
+
+
+@pytest.mark.parametrize(
+    "positions,headings,excluded",
+    [
+        ((0.0,) * 10, (0.0,) * 9, 0),
+        ((0.0,) * 9 + (math.nan,), (0.0,) * 10, 0),
+        ((0.0,) * 10, (0.0,) * 9 + (math.inf,), 0),
+        ((0.0,) * 9 + (-1.0,), (0.0,) * 10, 0),
+        ((0.0,) * 10, (0.0,) * 10, -1),
+        ((0.0,) * 10, (0.0,) * 10, True),
+    ],
+)
+def test_pure_error_aggregation_rejects_misaligned_nonfinite_or_invalid_counts(
+    positions, headings, excluded
+) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        aggregate_tf_ego_errors(
+            positions,
+            headings,
+            excluded,
+        )
+
+
+def test_single_header_diagnostic_is_numeric_primitive_not_an_epoch_selector() -> None:
+    """Epoch choice belongs to ros1.bag_reader before this flat Header view."""
+
+    ego, tf = _exact_records(10)
+
+    assert compute_tf_ego_diagnostic(ego, tf, max_bracket_ns=0).comparable_count == 10
 
 
 @pytest.mark.parametrize(
