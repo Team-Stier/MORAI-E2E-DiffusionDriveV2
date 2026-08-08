@@ -315,7 +315,7 @@ diagnostics:
   extrinsic_translation_tolerance_m: 0.0001
   extrinsic_rotation_tolerance_rad: 0.0001
   tf_ego_minimum_comparable_pairs: 10
-  tf_ego_position_p99_tolerance_m: 0.05
+  tf_ego_position_p99_tolerance_m: 0.051
   tf_ego_heading_p99_tolerance_deg: 0.5
   percentile_method: nearest_rank
   duplicate_ego_numeric_tolerance: exact

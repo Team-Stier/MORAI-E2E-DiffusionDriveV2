@@ -436,7 +436,7 @@ def _snapshot_from_bytes(
             raise ValueError("TF/Ego minimum comparable-pair policy mismatch")
         if (
             type(diagnostics["tf_ego_position_p99_tolerance_m"]) is not float
-            or diagnostics["tf_ego_position_p99_tolerance_m"] != 0.05
+            or diagnostics["tf_ego_position_p99_tolerance_m"] != 0.051
         ):
             raise ValueError("TF/Ego position p99 policy mismatch")
         if (

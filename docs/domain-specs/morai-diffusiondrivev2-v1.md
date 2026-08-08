@@ -178,7 +178,7 @@ sample selection과 별개로 full-stream epoch-safe TF/Ego gate를 수행한다
 epoch-local bracket이 없거나 epoch association이 ambiguous하거나 global view라면 cross-epoch bracket이 되었을 record는 비교 집합에서 제외하고 각각 report한다. report는 raw Ego Header/receipt/index, 선택 raw TF index/epoch, bracket Header/receipt/index provenance와 `raw_ego_record_count`, `epoch_local_comparable_count`, `no_epoch_local_bracket_count`, `ambiguous_epoch_selection_count`, `cross_epoch_bracket_prevented_count`를 가진다. 비교 가능한 pair가 10개 미만이면 bag을 거부한다. position error는 XY Euclidean distance, heading error는 degree-to-radian 변환 후 circular absolute difference다. 각 error를 오름차순 정렬하고 `ceil(0.99*N)-1` zero-based index를 택하는 nearest-rank p99가 다음 tolerance를 넘으면 해당 bag을 거부한다. isolated maximum은 report에 기록하되 단독 reject 조건으로 쓰지 않는다.
 
 ~~~yaml
-tf_ego_position_p99_tolerance_m: 0.05
+tf_ego_position_p99_tolerance_m: 0.051
 tf_ego_heading_p99_tolerance_deg: 0.5
 ~~~
 

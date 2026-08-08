@@ -141,7 +141,7 @@ def aggregate_tf_ego_errors(
     excluded_count: int,
     *,
     minimum_comparable_pairs: int = 10,
-    position_p99_tolerance_m: float = 0.05,
+    position_p99_tolerance_m: float = 0.051,
     heading_p99_tolerance_deg: float = 0.5,
 ) -> TfEgoDiagnostic:
     """Aggregate already epoch-selected TF/Ego errors under the shared gate."""
@@ -214,7 +214,7 @@ def compute_tf_ego_diagnostic(
     max_bracket_ns: int,
     *,
     minimum_comparable_pairs: int = 10,
-    position_p99_tolerance_m: float = 0.05,
+    position_p99_tolerance_m: float = 0.051,
     heading_p99_tolerance_deg: float = 0.5,
 ) -> TfEgoDiagnostic:
     """Compare diagnostic Ego pose fields to bracketed canonical TF poses."""

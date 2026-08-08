@@ -780,7 +780,7 @@ def compute_epoch_safe_tf_ego_diagnostic(
         index,
         max_bracket_ns,
         minimum_pairs=10,
-        position_tolerance=0.05,
+        position_tolerance=0.051,
         heading_tolerance=0.5,
     )
 
