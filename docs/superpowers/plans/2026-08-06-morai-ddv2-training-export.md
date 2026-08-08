@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- This plan depends on a completed and verified `2026-08-06-morai-ddv2-preprocess-config-cache.md`, including a production manifest from exactly 30 eligible bags and a 24/6 bag split.
+- This plan depends on a completed and verified schema-v2 `2026-08-06-morai-ddv2-preprocess-config-cache.md`, including the audited Option D resolved-domain hash, a production manifest from exactly 30 eligible bags, and a 24/6 bag split. Schema 1 or ambiguous single-stamp provenance is rejected.
 - Use the pinned source gitlinks only: DiffusionDriveV2 `1cd12a1e155c34dcc471261835444c8d5587580b`, Validator `09a3b88e19ae3354903ed676a35e02416284cb58`, and DiffusionDrive reference `9b52ed0ec06b073d82d6f392ab084c7b301c8681` as provenance only.
 - Use Python 3.9.25 and the Validator `diffusiondrive_v2.lock`; do not import ROS into this environment and do not mix `/usr/lib/python3/dist-packages` into it.
 - Begin every project Python module with `from __future__ import annotations`; the shared package must import under both Python 3.8 and 3.9.
@@ -507,7 +507,7 @@ def build_dataloaders(manifest: VerifiedManifest, config: TrainingConfig) -> tup
 ```
 
 - [ ] Test that only manifest-declared train bags enter train and only validation bags enter validation, sample order is stable by `(relative_bag_path,timestamp_ns)`, no frame leakage exists, and production loader rejects dirty/development caches.
-- [ ] Assert each returned item has exactly three top-level keys: `features`, `trajectory`, and `metadata`. `features` has exactly `camera_feature [3,256,1024]`, `lidar_feature [1,256,256]`, and `status_feature [8]`; `trajectory` is `[8,3]`; all four tensors are float32. `metadata` has exactly `sample_id`, `bag_sha256`, `relative_bag_path`, `timestamp_ns`, `command_name`, `command_index`, and `split`.
+- [ ] Assert each returned item has exactly three top-level keys: `features`, `trajectory`, and `metadata`. `features` has exactly `camera_feature [3,256,1024]`, `lidar_feature [1,256,256]`, and `status_feature [8]`; `trajectory` is `[8,3]`; all four tensors are float32. `metadata` carries `sample_id`, bag/path/split, selected-front Header `timestamp_ns`, `grid_receipt_ns`, all four sensor Header/receipt/index arrays, trajectory-anchor TF Header/receipt/index/clock-epoch, command name/index, and the complete manifest row identity. Training/validation seed uses only `timestamp_ns`; receipt never replaces it.
 - [ ] Encode these exact recommended defaults: seed `20260806`, epochs `30`, batch size `8`, workers `4`, AdamW learning rate `1e-5`, weight decay `1e-4`, AMP true, gradient clip norm `1.0`, trajectory weight `12.0`, preservation weight `1e-3`, validation batch size `1`, fixed run ID `morai-ddv2-v1-oracle-command-validation-v1`, and an operational mid-epoch checkpoint interval of `100` optimizer steps. Reject any trajectory/preservation weights other than `12.0` and `1e-3`, and reject validation batch sizes other than `1`.
 - [ ] Implement `StatefulPermutationSampler` with one private CPU `torch.Generator`. It materializes one `randperm` per epoch and stores the permutation, generator state, epoch, and **committed** cursor. `__iter__` may run ahead because DataLoader workers prefetch, so it must not advance the committed cursor; the trainer calls `mark_consumed(actual_batch_size)` only after a successful optimizer/scaler step. `finish_epoch()` is legal only when the committed cursor equals the dataset size, then increments the epoch and draws the next permutation. `load_state_dict` rejects a different dataset size, a non-permutation, an out-of-range cursor, or an epoch mismatch.
 
@@ -770,7 +770,7 @@ def reset_torch_seed(seed: int) -> None:
 - [ ] Run `.venv-train/bin/python -m pytest tests/unit/training/test_metrics.py tests/unit/training/test_validation.py -q`. Expected: FAIL.
 - [ ] Set the network eval while validating, use the same PDM-free learned selector public derivative used by Validator, B=1 only, and final returned `trajectory`. Capture the exact post-Bézier coarse top-32 from that same forward only for diagnostic `minADE@32`/`minFDE@32`. Never use GT-nearest `m_star`, GT trajectory, decoder logits, the full 800 proposal pool, or the four stage winners to select a candidate or compute the named @32 metrics.
 - [ ] Keep metric aggregation, heading reconstruction, wrapping, and seed derivation NumPy/stdlib-only in `training/metrics.py`; import Torch locally only inside `reset_torch_seed` or in `validation.py`. This lets the ROS report path reuse exact metrics without importing Torch.
-- [ ] Restore the exact training boundary after selector and loss validation. Write reports with domain/oracle labels, run ID, per-sample seed, selected metrics, candidate source/count, per-sample min/ranks, aggregate minADE@32/minFDE@32, counts, drop/sync statistics, identities, and no non-JSON floats. Sort serialized `records` by `sample_id` and omit traversal order and wall-clock generation time so manifest-order and reverse-order runs with identical per-sample outputs produce byte-identical canonical reports.
+- [ ] Restore the exact training boundary after selector and loss validation. Write reports with domain/oracle labels, run ID, per-sample seed, selected metrics, candidate source/count, per-sample min/ranks, aggregate minADE@32/minFDE@32, counts, drop statistics, separate side-Header/sensor-receipt/TF-anchor-receipt/TF-epoch statistics, schema-v2 provenance identities, and no non-JSON floats. Sort serialized `records` by `sample_id` and omit traversal order and wall-clock generation time so manifest-order and reverse-order runs with identical per-sample outputs produce byte-identical canonical reports.
 - [ ] Run `.venv-train/bin/python -m pytest tests/unit/training/test_metrics.py tests/unit/training/test_validation.py -q`. Expected: PASS.
 - [ ] Commit.
 
@@ -807,6 +807,9 @@ scripts/evaluate.py offline --manifest PATH --resolved-domain PATH --base-profil
 class ProductionRunAttestation:
     training_config_sha256: str
     training_manifest_sha256: str
+    resolved_domain_sha256: str
+    cache_schema_version: Literal[2]
+    clock_policy_version: Literal[1]
     base_checkpoint_sha256: str
     completed_epochs: int
     best_checkpoint_sha256: str
@@ -837,7 +840,7 @@ def rebuild_training_artifacts(run_dir: Path) -> TrainingArtifactHashes
 def publish_production_run_attestation(run_dir: Path, attestation: ProductionRunAttestation) -> Path
 ```
 
-- [ ] Test CLI preflight failures before model construction: wrong domain/preset/manifest hash, dirty cache, wrong source commit, missing assets, wrong Python/Torch, unavailable CUDA for an actual training invocation, zero/negative values for each `--max-*` smoke bound, and any offline `--sample-order` other than `manifest` or `reverse`. Test that omitted bounds preserve the YAML values, supplied positive bounds are recorded in the resolved run config and limit only that invocation, and reverse order changes traversal only while canonical report rows remain sample-ID sorted.
+- [ ] Test CLI preflight failures before model construction: schema other than 2, wrong Option D resolved-domain/domain/preset/manifest hash, incomplete or mixed-axis provenance, dirty cache, wrong source commit, missing assets, wrong Python/Torch, unavailable CUDA for an actual training invocation, zero/negative values for each `--max-*` smoke bound, and any offline `--sample-order` other than `manifest` or `reverse`. Test that omitted bounds preserve the YAML values, supplied positive bounds are recorded in the resolved run config and limit only that invocation, and reverse order changes traversal only while canonical report rows remain sample-ID sorted.
 - [ ] Test a two-epoch fake-model fit: training boundary reapplied each epoch, selector and supervised-loss validation B=1, `last.pt` every epoch, `best.pt` only on strictly lower selected micro ADE, selected FDE/heading/macro plus minADE@32/minFDE@32 logged, and resume continues epoch/global step/RNG/accumulator exactly. Test crash reconciliation at (a) mid-epoch, (b) durable epoch JSON before sampler-finished `last.pt`, and (c) next-epoch `last.pt` with missing/mismatched epoch JSON, which must fail. Atomically publish `run-complete.json` only after all configured epochs finish with all three smoke bounds absent; it binds config/manifest/base/best hashes, epoch count, history/CSV/PNG hashes. Interrupted and bounded smoke/debug runs must not have this attestation.
 - [ ] Write telemetry tests first. One authoritative file per completed epoch is `metrics/epochs/epoch-{epoch:04d}.json`, RFC 8785 canonical bytes, published by sibling `.partial`/file-fsync/replace/parent-fsync with no wall-clock or nonfinite value. Existing exact bytes are idempotent; conflicting bytes fail. From sorted epoch files, atomically rebuild `metrics/history.jsonl`, `metrics/epoch_metrics.csv`, and `plots/training-curves.png` rather than appending. CSV columns are epoch/global_step, train and validation total/trajectory/preservation loss, selected ADE/FDE/heading, minADE@32/minFDE@32, and best flag. PNG has exactly three labeled panels: train/validation total loss; selected ADE/FDE; minADE@32/minFDE@32. A generated plot is never resume state.
 - [ ] Implement `fit` with constant recommended AdamW learning rate from config; do not add an unapproved scheduler. Before constructing the optimizer, call `assert_loss_contract` against the loaded upstream head and resolved outer weights, then pass both outer weights explicitly to every train and validation-loss call. At epoch end atomically publish the full validation report and `best.pt` if improved, publish epoch telemetry, call `sampler.finish_epoch()`, clear the accumulator for the next epoch, publish `last.pt` with the epoch-record SHA-256, rebuild JSONL/CSV/PNG, then start the next epoch. A cursor-at-end resume with an exact existing epoch record completes this sequence idempotently; a next-epoch checkpoint without the bound record fails. Keep step JSONL and resolved training config with all source/cache/checkpoint identities and smoke bounds.
@@ -947,6 +950,8 @@ class ExportIdentities:
     resolved_domain_sha256: str
     sensor_preset_sha256: str
     training_manifest_sha256: str
+    cache_schema_version: Literal[2]
+    clock_policy_version: Literal[1]
     training_config_sha256: str
     source_commits: Mapping[str, str]
     best_micro_ade: float
@@ -962,6 +967,8 @@ class ExportMetadata:
     resolved_domain_sha256: str
     sensor_preset_sha256: str
     training_manifest_sha256: str
+    cache_schema_version: Literal[2]
+    clock_policy_version: Literal[1]
     training_config_sha256: str
     domain_id: str
     source_commits: Mapping[str, str]
@@ -986,7 +993,7 @@ def export_sel_bundle(base: RawSelCheckpoint, mutable_state: Mapping[str, torch.
 ```
 
 - [ ] Test that the top-level raw checkpoint container is shallow-preserved and only its state mapping is replaced. Assert 972 keys, 971 runtime keys, original vocab bytes, unchanged frozen hashes, and absence of metadata keys in the checkpoint.
-- [ ] Assert metadata contains exactly the `ExportMetadata` fields above, including the authoritative `raw_schema_sha256`: base checkpoint/state hashes, export checkpoint/state hashes, resolved-domain/preset/training-manifest hashes, domain ID, source commits, five trainable prefixes, mutable BN policy, raw/runtime counts 972/971, training config hash, best micro ADE, run ID, and export timestamp. It must not contain a self-referential `metadata_sha256`.
+- [ ] Assert metadata contains exactly the `ExportMetadata` fields above, including the authoritative `raw_schema_sha256`: base checkpoint/state hashes, export checkpoint/state hashes, resolved-domain/preset/training-manifest hashes, explicit cache schema 2 and clock-policy version 1, domain ID, source commits, five trainable prefixes, mutable BN policy, raw/runtime counts 972/971, training config hash, best micro ADE, run ID, and export timestamp. It must not contain a self-referential `metadata_sha256`.
 - [ ] Inject checkpoint write/fsync/rename and metadata write/fsync/rename failures. Metadata final path must never exist before the finalized checkpoint's actual file hash is known; a metadata failure leaves a verifiable checkpoint but an incomplete bundle that preflight rejects.
 
 ```python
@@ -1056,7 +1063,7 @@ def verify_validator_bundle(profile_file: Path, validator_root: Path) -> Verifie
 ```gitignore
 /profile-morai-ddv2-oracle.json
 ```
-- [ ] Test runtime assets with real absolute paths and actual hashes for checkpoint, checkpoint metadata, resolved domain, sensor preset, training manifest, image backbone, and trajectory anchor. Profile identity repeats domain ID, resolved hash, exported state hash, exact raw-schema hash, and training manifest hash.
+- [ ] Test runtime assets with real absolute paths and actual hashes for checkpoint, checkpoint metadata, resolved domain, sensor preset, training manifest, image backbone, and trajectory anchor. Profile identity repeats domain ID, resolved hash, exported state hash, exact raw-schema hash, training manifest hash, cache schema 2, and clock-policy version 1.
 - [ ] Assert the generated profile's camera contract names the 640×480 side and 1280×720 front sources plus the exact 341/455/341 resize, `[56,1080)` crop, and RGB float32 output; LiDAR contract names `[1.5,0,1.25]`, the 3D self-mask, and count/5. Set `static_transforms.T_base_from_lidar` to identity rotation with translation `[1.5,0.0,1.25]`, and set `inference_policy.reference_stamp_policy` to `new_stamp_once`.
 - [ ] Test preflight order with spies: Validator `load_selected_profile`→existing `verify_runtime_assets`→mandatory metadata read→checkpoint/profile/metadata file-hash equality→972 tensor and exact key/shape schema hashes→domain/sensor/manifest identity. Every metadata/hash/identity mismatch must fail before network construction. Only after those checks, construct the pinned PDM-free derivative, normalize 972→971, and invoke Validator's `load_diffusiondrive_selector_state_dict`, which must reach the derivative's actual `load_state_dict(normalized, strict=True)`; same-count renamed keys and wrong shapes fail there.
 

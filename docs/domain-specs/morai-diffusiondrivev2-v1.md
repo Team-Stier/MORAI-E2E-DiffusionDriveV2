@@ -4,6 +4,7 @@
 - 상태: 사용자 승인 완료
 - 작성일: 2026-08-06
 - 관련 설계: docs/superpowers/specs/2026-08-06-morai-diffusiondrivev2-domain-adaptation-design.md
+- clock 감사 근거: docs/domain-specs/morai-ddv2-clock-audit-20260808.md
 
 이 문서는 ROS bag에서 생성되는 학습 sample과 DiffusionDriveV2가 실제로 받는 tensor의 단일 기준이다. 전처리기, 학습 loader, checkpoint metadata 및 ROS Validator는 모두 이 계약을 만족해야 한다.
 
@@ -60,26 +61,44 @@ NAVSIM의 공식 trajectory origin은 rear axle이지만 MORAI bag에는 rear ax
 
 ### 2.2 Timestamp
 
-- Header.stamp만 sample selection에 사용해야 한다.
-- bag receipt time은 provenance 용도 외에 사용하면 안 된다.
-- 각 topic의 stamp는 nearest search 전에 정렬해야 한다.
+- `Header.stamp`와 rosbag read API가 반환하는 bag receipt stamp를 서로 다른 clock axis로 취급해야 한다.
+- bag receipt stamp는 recorder가 message를 관측하고 기록한 순서의 clock이다. 센서 acquisition time이라고 주장하거나 물리 상태의 시간축으로 해석하면 안 된다.
+- grid와 front/LiDAR/trajectory-anchor TF association에는 receipt axis를 사용한다. side camera exposure association과 Ego/future-pose interpolation에는 native Header axis를 사용한다.
+- affine 또는 piecewise receipt→Header 변환을 production sample selection에 사용하면 안 된다.
+- offline rosbag record API와 cache provenance field는 반드시 `header_stamp_ns`와 `receipt_stamp_ns`를 명시해야 한다. ROS record에 의미가 불분명한 단일 `stamp_ns` field를 사용하면 안 된다. ROS callback API가 exact bag receipt를 노출하지 않는 runtime에서는 receipt를 callback time이나 `/clock`으로 꾸며내지 않고 verified manifest 값을 사용한다.
 - 같은 bag 안에서만 입력 선택과 future interpolation을 수행해야 한다.
 
 ~~~yaml
 sample_rate_hz: 2.0
-grid_period_ms: 500
-grid_origin_ns: ceil_div(first_front_ns, 500000000) * 500000000
-front_grid_tolerance_ms: 50
-side_camera_nearest_tolerance_ms: 30
-lidar_nearest_tolerance_ms: 45
+grid_period_ns: 500000000
+grid_axis: receipt_stamp_ns
+grid_origin_receipt_ns: ceil_div(first_valid_front_receipt_ns, 500000000) * 500000000
+front_receipt_tolerance_ns: 50000000
+side_header_tolerance_ns: 30000000
+side_receipt_sanity_tolerance_ns: 100000000
+lidar_receipt_tolerance_ns: 45000000
+trajectory_anchor_tf_receipt_tolerance_ns: 50000000
 ego_state_max_bracket_ms: 100
 pose_max_bracket_ms: 100
 drop_on_required_sensor_miss: true
 ~~~
 
-`first_front_ns`는 다른 sensor sync 결과와 무관하게 JPEG decode, Camera-1 frame 및 1280×720 resolution 검사를 통과한 front message 중 가장 작은 Header.stamp nanosecond 값이다. grid와 tolerance 계산은 float seconds가 아니라 signed integer nanoseconds로 수행한다. nearest 후보 정렬 key는 `(abs(source_ns-target_ns), source_ns, stable_record_index)`이며 동률이면 더 이른 source, 그 다음 bag 안에서 먼저 기록된 message를 선택한다. tolerance 경계는 `abs(offset_ns) <= tolerance_ns`로 포함한다.
+`first_valid_front_receipt_ns`는 다른 sensor sync 결과와 무관하게 JPEG decode, Camera-1 frame 및 1280×720 resolution 검사를 통과한 front message 중 가장 작은 receipt nanosecond 값이다. 모든 grid, tolerance 및 offset 계산은 float seconds가 아니라 signed integer nanoseconds로 수행한다. 모든 tolerance 경계는 `abs(offset_ns) <= tolerance_ns`로 포함한다.
 
-`stable_record_index`는 해당 topic message의 zero-based bag read order다. `/tf` canonical pose series에서는 TFMessage 안의 TransformStamped 순서까지 flatten한 zero-based order를 사용한다. 동일 Header.stamp의 `/Ego_topic` used fields 또는 `map -> base_link` transform이 여러 개면 값이 같은 duplicate를 가장 이른 record 하나로 collapse한다. Ego used fields의 finite float 값은 수치적으로 같아야 하며, TF duplicate는 translation 1e-6 m와 sign-invariant rotation angle 1e-6 rad 안에서 같아야 한다. 이를 넘는 conflicting duplicate는 bag을 reject한다.
+2 Hz receipt grid마다 front는 `(abs(front_receipt-grid_receipt), front_receipt, stable_record_index)` 최소값을 50 ms 안에서 선택한다. 선택된 front의 `Header.stamp`는 `timestamp_ns`, receipt-grid target은 `grid_receipt_ns`다.
+
+left/right는 각각 후보 집합을 먼저 다음 두 inclusive 조건의 교집합으로 제한한다.
+
+1. `abs(side_header-front_header) <= 30 ms`
+2. `abs(side_receipt-front_receipt) <= 100 ms`
+
+그 뒤 `(abs(side_header-front_header), side_header, stable_record_index)` 최소값을 선택한다. receipt 조건을 통과하지 않은 Header-nearest frame으로 fallback하면 안 된다. LiDAR는 `(abs(lidar_receipt-front_receipt), lidar_receipt, stable_record_index)` 최소값을 45 ms 안에서 선택하며 LiDAR Header를 sync 결정에 사용하면 안 된다.
+
+`map -> base_link` trajectory anchor TF는 `(abs(tf_receipt-front_receipt), tf_receipt, stable_record_index)` 최소값을 50 ms 안에서 정확히 하나 선택한다. 두 번째 후보로 재선택하지 않는다. 선택한 record의 native Header를 `T0`로 삼고 그 TF pose를 current pose로 exact 사용한다. `/Ego_topic` velocity/acceleration은 native Header axis에서 `T0`를 bracket-only 보간한다.
+
+TF clock epoch는 `map -> base_link` record를 `(receipt_stamp_ns, stable_record_index)` 순서로 읽었을 때 native Header가 nondecreasing인 maximal 구간이다. 이전 record보다 Header가 strict하게 작아지면 새 epoch를 시작한다. 같은 Header의 equivalent duplicate는 그 epoch 안에서 가장 이른 record만 남기고 conflict는 bag을 reject한다. future target은 `T0+0.5,...,T0+4.0 s`이며 선택 anchor부터 시작하는 동일 epoch의 receipt-order causal suffix 안에서만 Header bracket을 만든다. bracket gap은 100 ms 이하여야 하고 extrapolation, epoch/reset crossing 및 anchor 이전 record 재사용은 금지한다.
+
+`stable_record_index`는 camera/LiDAR/Ego topic message의 zero-based bag read order다. `/tf`에서는 모든 TFMessage 안의 TransformStamped를 message 순서대로 flatten한 zero-based order다. 동일 native Header의 `/Ego_topic` used fields는 값이 같은 duplicate를 가장 이른 record 하나로 collapse한다. Ego used fields의 finite float 값은 수치적으로 같아야 하며, TF duplicate는 translation 1e-6 m와 sign-invariant rotation angle 1e-6 rad 안에서 같아야 한다. 이를 넘는 conflicting duplicate는 bag을 reject한다.
 
 ## 3. Raw ROS contract
 
@@ -146,11 +165,11 @@ extrinsic_rotation_tolerance_rad: 1.0e-4
 - `/Ego_topic` velocity/acceleration은 SI 단위의 `base_link` body-frame 값이며 회전 또는 scale 변환 없이 사용한다.
 - bag에는 rear-axle frame과 확정 차량 geometry가 없으므로 base_link-to-rear-axle 보정을 추정해서 적용하면 안 된다.
 
-요청 시각과 동일한 source stamp가 있으면 해당 source를 직접 사용하고 bracket stamp를 `[t,t]`, weight를 0으로 기록한다. 그 외에는 바로 이전 `t0`와 바로 다음 `t1`만 bracket으로 사용하고 `w=(t-t0)/(t1-t0)`로 계산한다.
+current pose는 receipt-nearest로 선택한 trajectory-anchor TF 자체를 사용하고 Header/receipt/index bracket을 각각 `[T0,T0]`, `[R0,R0]`, `[i0,i0]`, weight를 0으로 기록한다. Ego와 future pose의 native Header 요청 시각과 동일한 source가 있으면 해당 source를 직접 사용하고 Header/receipt/index bracket의 양쪽을 같은 record로 기록한다. 그 외에는 허용된 source series에서 바로 이전 `t0`와 바로 다음 `t1`만 bracket으로 사용하고 `w=(t-t0)/(t1-t0)`로 계산한다. interpolation weight cache dtype은 float32다.
 
 TF translation은 양쪽 stamp 사이에서 선형 보간하고 rotation quaternion은 shortest-arc SLERP한다. `q0,q1`을 먼저 정규화하고 dot(q0,q1)<0이면 q1의 부호를 뒤집는다. 그 뒤 dot>0.9995면 normalized linear interpolation을, 아니면 SLERP를 적용하고 결과를 다시 정규화한다. `/Ego_topic` velocity/acceleration도 양쪽 stamp 사이에서 선형 보간한다. 모든 보간은 앞뒤 두 source가 있는 bracket 안에서만 허용하며 extrapolation은 금지한다. 현재 pose, future pose 및 Ego state 각각의 bracket 간격은 100 ms 이하여야 한다.
 
-각 `/Ego_topic` stamp에서 위 규칙으로 canonical TF pose를 보간해 진단용 Ego XY 및 yaw와 비교한다. TF bracket을 만들 수 없는 bag 양끝 stamp는 진단 집합에서 제외하되 비교 가능한 pair가 10개 미만이면 bag을 거부한다. position error는 XY Euclidean distance, heading error는 degree-to-radian 변환 후 circular absolute difference다. 각 error를 오름차순 정렬하고 `ceil(0.99*N)-1` zero-based index를 택하는 nearest-rank p99가 다음 tolerance를 넘으면 해당 bag을 거부한다. isolated maximum은 report에 기록하되 단독 reject 조건으로 쓰지 않는다.
+sample selection과 별개로, full-stream `/Ego_topic` native Header마다 같은 native Header axis에서 canonical TF pose를 보간해 진단용 Ego XY 및 yaw와 비교한다. receipt-aligned pose 비교나 affine bridge 결과를 이 bag gate에 사용하면 안 된다. TF bracket을 만들 수 없는 bag 양끝 stamp는 진단 집합에서 제외하되 비교 가능한 pair가 10개 미만이면 bag을 거부한다. position error는 XY Euclidean distance, heading error는 degree-to-radian 변환 후 circular absolute difference다. 각 error를 오름차순 정렬하고 `ceil(0.99*N)-1` zero-based index를 택하는 nearest-rank p99가 다음 tolerance를 넘으면 해당 bag을 거부한다. isolated maximum은 report에 기록하되 단독 reject 조건으로 쓰지 않는다.
 
 ~~~yaml
 tf_ego_position_p99_tolerance_m: 0.05
@@ -160,15 +179,16 @@ tf_ego_heading_p99_tolerance_deg: 0.5
 ## 4. Sample selection
 
 1. bag 시작 시 필수 topic, message type, frame 및 sensor preset을 검증한다.
-2. 2 Hz grid마다 가장 가까운 front frame을 50 ms 안에서 선택한다.
-3. 선택한 front Header.stamp를 sample timestamp로 사용한다.
-4. left/right를 각각 30 ms, LiDAR를 45 ms 안에서 선택한다.
-5. `/Ego_topic`의 velocity/acceleration을 sample timestamp에 bracket-only 선형 보간한다.
-6. `/tf map -> base_link`를 sample timestamp와 미래 0.5초 간격 8개 시각에 translation 선형 보간과 quaternion SLERP로 보간한다.
-7. 어느 필수 값이라도 없거나 비유한 값이면 sample을 생성하지 않는다.
+2. valid front receipt 범위에 2 Hz receipt grid를 만들고 grid마다 receipt-nearest front를 50 ms 안에서 선택한다.
+3. 선택한 front Header를 sample `timestamp_ns`, grid target을 `grid_receipt_ns`로 사용한다.
+4. left/right는 Header 30 ms와 receipt 100 ms dual-filter 뒤 Header tie로 선택한다.
+5. LiDAR는 front receipt 기준 45 ms 안에서 receipt-nearest로 선택한다.
+6. `map -> base_link` TF는 front receipt 기준 50 ms 안에서 receipt-nearest로 하나 선택하고 그 native Header `T0`의 pose를 current pose로 exact 사용한다.
+7. `/Ego_topic` velocity/acceleration은 native Header `T0`에 bracket-only 선형 보간한다.
+8. 선택 TF와 같은 receipt-order monotone TF clock epoch의 causal suffix에서 native Header `T0+0.5,...,T0+4.0 s`를 translation 선형 보간과 quaternion SLERP로 보간한다.
+9. 어느 필수 값이라도 없거나 비유한 값이면 sample을 생성하지 않는다.
 
-한 raw 메시지는 여러 anchor에 재사용할 수 있지만 sample metadata에는 실제 source stamp를 모두 기록해야 한다.
-Ego state 또는 pose 보간의 양쪽 source stamp 간격이 100 ms를 넘으면 sample을 drop해야 한다. source 앞이나 뒤로 extrapolation하면 안 된다.
+한 raw 메시지는 여러 anchor에 재사용할 수 있지만 sample metadata에는 실제 Header, receipt와 stable record index를 모두 기록해야 한다. Ego 또는 future-pose bracket 간격이 100 ms를 넘으면 sample을 drop해야 한다. source 앞이나 뒤로 extrapolation하거나 TF clock epoch/reset을 넘으면 안 된다. nearest 후보가 이후 validation을 통과하지 못해도 두 번째 후보를 고르는 fallback은 금지한다.
 
 ## 5. Camera feature
 
@@ -375,7 +395,9 @@ path length는 `p0=(0,0)`, `p1..p8=trajectory[:,0:2]`에 대해 `sum(i=1..8, ||p
 
 ## 10. Cache record
 
-bag 하나는 cache root 기준 `bags/<domain_id>/<resolved_domain_sha256>/<source_bag_sha256>.h5` 하나로 직렬화한다. sample ID는 lowercase bag SHA-256, colon, unsigned decimal front anchor stamp를 연결한 `<source_bag_sha256>:<timestamp_ns>`이며 dataset 전체에서 유일해야 한다.
+cache/manifest/command-sidecar schema version은 2다. resolved-domain root schema는 1을 유지할 수 있지만 resolved-domain hash는 clock policy와 cache schema 변경으로 반드시 바뀐다.
+
+bag 하나는 cache root 기준 `bags/<domain_id>/<resolved_domain_sha256>/<source_bag_sha256>.h5` 하나로 직렬화한다. sample ID는 lowercase bag SHA-256, colon, unsigned decimal selected-front Header를 연결한 `<source_bag_sha256>:<timestamp_ns>`이며 dataset 전체에서 유일해야 한다. `timestamp_ns`는 selected front Header이고 `grid_receipt_ns`나 callback time으로 대체하면 안 된다.
 
 | Dataset | dtype | Shape |
 |---|---|---|
@@ -384,22 +406,36 @@ bag 하나는 cache root 기준 `bags/<domain_id>/<resolved_domain_sha256>/<sour
 | status | float32 | [N,8] |
 | trajectory | float32 | [N,8,3] |
 | timestamp_ns | int64 | [N] |
-| sensor_source_stamp_ns | int64 | [N,4] |
+| grid_receipt_ns | int64 | [N] |
+| sensor_source_header_stamp_ns | int64 | [N,4] |
+| sensor_source_receipt_ns | int64 | [N,4] |
 | sensor_source_record_index | int64 | [N,4] |
-| sensor_sync_offset_ns | int64 | [N,3] |
-| ego_bracket_stamp_ns | int64 | [N,2] |
+| side_camera_header_offset_ns | int64 | [N,2] |
+| sensor_receipt_offset_ns | int64 | [N,3] |
+| trajectory_anchor_tf_header_ns | int64 | [N] |
+| trajectory_anchor_tf_receipt_ns | int64 | [N] |
+| trajectory_anchor_tf_record_index | int64 | [N] |
+| trajectory_anchor_tf_clock_epoch_index | int64 | [N] |
+| ego_bracket_header_stamp_ns | int64 | [N,2] |
+| ego_bracket_receipt_ns | int64 | [N,2] |
 | ego_bracket_record_index | int64 | [N,2] |
 | ego_interp_weight | float32 | [N] |
-| pose_bracket_stamp_ns | int64 | [N,2] |
-| pose_bracket_record_index | int64 | [N,2] |
-| pose_interp_weight | float32 | [N] |
-| future_pose_bracket_stamp_ns | int64 | [N,8,2] |
+| current_pose_bracket_header_stamp_ns | int64 | [N,2] |
+| current_pose_bracket_receipt_ns | int64 | [N,2] |
+| current_pose_bracket_record_index | int64 | [N,2] |
+| current_pose_interp_weight | float32 | [N] |
+| future_pose_bracket_header_stamp_ns | int64 | [N,8,2] |
+| future_pose_bracket_receipt_ns | int64 | [N,8,2] |
 | future_pose_bracket_record_index | int64 | [N,8,2] |
 | future_pose_interp_weight | float32 | [N,8] |
 
-sensor source stamp/index의 마지막 축 순서는 front, left, right, lidar다. bracket record index는 duplicate collapse 뒤 선택된 원본 stable record를 가리킨다. `sensor_sync_offset_ns`는 left, right, lidar source stamp에서 front anchor stamp를 뺀 signed nanosecond 값이다. 각 interpolation weight는 `t=(1-w)*t0+w*t1`의 `w`이며 범위는 [0,1]이다.
+sensor source Header/receipt/index의 마지막 축 순서는 front, left, right, lidar다. `side_camera_header_offset_ns`는 left/right Header에서 selected-front Header를 뺀 `[left,right]` signed nanosecond다. LiDAR Header는 provenance로만 저장하며 sync offset 의미를 부여하지 않는다. `sensor_receipt_offset_ns`는 left/right/lidar receipt에서 selected-front receipt를 뺀 `[left,right,lidar]` signed nanosecond다. 서로 다른 clock axis를 한 offset dataset에 섞으면 안 된다.
 
-command sidecar 경로는 cache root 기준 `commands/<domain_id>/<resolved_domain_sha256>/<source_bag_sha256>.jsonl`이다. `.partial` 파일에 쓴 뒤 fsync하고 원자적으로 rename한다. record는 `timestamp_ns` 오름차순이고 timestamp가 중복되면 안 된다. 각 record는 `domain_id`, `resolved_domain_sha256`, `sensor_preset_sha256`, `source_bag_sha256`, `command_rule_sha256`, `timestamp_ns`, `command_index`, `command_name`, `provenance=future_trajectory_oracle`을 가진다. index mapping은 LEFT=0, STRAIGHT=1, RIGHT=2, UNKNOWN=3이며 같은 값은 `status[:,0:4]`와 exact하게 일치해야 한다.
+`trajectory_anchor_tf_*`는 receipt-nearest로 선택한 exact current TF를 가리킨다. 따라서 `current_pose_bracket_*`는 Header `[T0,T0]`, receipt `[R0,R0]`, index `[i0,i0]`, weight `0`이어야 한다. bracket record index는 duplicate collapse 뒤 선택된 원본 stable record를 가리킨다. 각 interpolation weight는 native Header axis의 `t=(1-w)*t0+w*t1`에서 계산한 `w`이며 범위는 [0,1]이다. receipt bracket은 같은 두 source record의 receipt provenance이지 weight 계산 axis가 아니다.
+
+command sidecar 경로는 cache root 기준 `commands/<domain_id>/<resolved_domain_sha256>/<source_bag_sha256>.jsonl`이다. `.partial` 파일에 쓴 뒤 fsync하고 원자적으로 rename한다. record는 `timestamp_ns` 오름차순이고 timestamp가 중복되면 안 된다. 각 record는 `schema_version=2`, `domain_id`, `resolved_domain_sha256`, `sensor_preset_sha256`, `source_bag_sha256`, `command_rule_sha256`, `timestamp_ns`, `grid_receipt_ns`, `front_receipt_ns`, `front_record_index`, `command_index`, `command_name`, `provenance=future_trajectory_oracle`을 가진다. lookup key는 계속 `(source_bag_sha256,timestamp_ns)`이고 receipt를 key로 바꾸면 안 된다. index mapping은 LEFT=0, STRAIGHT=1, RIGHT=2, UNKNOWN=3이며 같은 값은 `status[:,0:4]`와 exact하게 일치해야 한다.
+
+schema-v2 manifest의 각 `sample` record는 위 HDF5 provenance field 전부를 같은 이름, 축 순서 및 값으로 반복하고 `hdf5_row_index`, `sidecar_row_index`와 artifact identity를 추가한다. manifest가 HDF5와 다른 clock axis, source index 또는 interpolation bracket을 기록하면 전체 artifact를 reject한다. `dataset` record의 `schema_version`도 2이며 loader는 schema 1과 2를 암묵적으로 혼용하거나 field 이름을 추측해 migration하면 안 된다.
 
 `command_rule_sha256`은 resolved-domain.json에 기록된 command mapping, threshold와 분류 순서를 canonical JSON으로 직렬화한 SHA-256이다. 전체 manifest는 완성 sidecar의 상대경로, record count와 파일 SHA-256을 저장한다. Validator는 namespace, 모든 identity field, record count 및 sidecar SHA-256을 추론 전에 검증해야 한다.
 
@@ -407,6 +443,8 @@ HDF5 attribute:
 
 | Attribute | 규칙 |
 |---|---|
+| cache_schema_version | 정수 2 |
+| clock_policy_version | 정수 1 |
 | domain_id | 정확히 morai-ddv2-v1-oracle-command |
 | sensor_preset_sha256 | 정확히 b7e69c70cc0b2948c3a5b352eee022be04f8884a1df135697f89bb4bb88263fb |
 | resolved_domain_sha256 | canonical resolved-domain.json의 실제 64자리 lowercase SHA-256 |
@@ -424,10 +462,10 @@ dataset manifest 경로는 `manifests/<domain_id>/<resolved_domain_sha256>/manif
 각 sample은 다음 조건을 모두 만족해야 한다.
 
 - 세 JPEG가 decode되고 preset 해상도와 일치
-- 모든 sync offset이 tolerance 안
+- front/LiDAR/TF receipt offset과 side Header/receipt dual offset이 각자의 tolerance 안
 - LiDAR x/y/z가 finite
 - Ego velocity/acceleration과 현재/future pose가 finite
-- 8개 future pose가 모두 같은 bag 안에 존재
+- 8개 future pose가 모두 같은 bag 및 trajectory-anchor TF clock epoch의 causal suffix 안에 존재
 - status command가 유효한 one-hot
 - 생성 tensor의 shape, dtype, range가 계약과 일치
 
@@ -529,6 +567,8 @@ exporter는 pinned Validator의 official baseline profile을 수정하지 않고
 
 offline preprocessor와 ROS Validator는 동일한 pure preprocessing functions와 resolved-domain.json을 사용해야 한다.
 
+ROS bag playback은 schema-v2 manifest가 고정한 per-topic `stable_record_index`, selected source record와 Ego/current/future bracket을 callback counter로 exact replay해야 한다. callback 시점의 `rospy.Time.now()`, 도착 순서에서 다시 계산한 nearest, 또는 Header만으로 source를 재선택하면 안 된다. callback counter와 observed Header가 manifest-selected stable index/Header와 일치하는지 검증한 뒤 manifest 선택을 사용하며, exact receipt provenance는 verified manifest가 공급한다. 특히 Header backstep이 있는 LiDAR buffer는 Header/receipt cutoff가 아니라 다음 manifest-required stable index를 기준으로만 prune해야 한다.
+
 Validator model load는 profile의 runtime asset hash 검증 후 metadata sidecar를 필수로 읽어야 한다. profile checkpoint SHA, metadata `export_checkpoint_sha256`와 실제 checkpoint SHA가 모두 같고, recompute한 state_dict hash가 `export_state_dict_sha256`와 같아야 한다. profile/metadata/cache의 domain, sensor 및 training-manifest identity도 일치한 뒤에만 prefix 제거와 vocab 한 key 제외 후 971-key `strict=True` load를 수행한다. baseline profile overwrite, metadata 누락 또는 hash/identity 불일치는 load 전에 실패해야 한다.
 
 Validator는 다음을 검증해야 한다.
@@ -566,6 +606,9 @@ domain 구현은 다음 검사를 통과해야 한다.
 10. sidecar 누락 시 Validator가 UNKNOWN fallback 없이 실패
 11. export checkpoint가 V2 SEL runtime에서 strict load
 12. 모델 출력이 finite [8,3]
+13. Header-nearest side 1순위가 receipt 100 ms를 위반하고 2순위가 dual-bound를 만족하면 2순위를 선택
+14. TF native Header backstep에서 새 epoch를 만들고 future bracket이 reset을 넘지 않음
+15. offline과 Validator가 manifest stable index/bracket을 replay하며 callback time으로 재선택하지 않음
 
 ## 16. Versioning rule
 
@@ -573,7 +616,8 @@ domain 구현은 다음 검사를 통과해야 한다.
 
 - sensor preset 또는 hash
 - topic/frame mapping
-- sync rate/tolerance
+- clock axis/policy, sync rate/tolerance 또는 tie-break
+- cache/manifest/sidecar schema
 - camera resize/crop/interpolation/color order
 - LiDAR transform/mask/range/binning
 - status field order 또는 units

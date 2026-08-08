@@ -49,22 +49,73 @@ ros_contract:
     intensity: float32
 
 sampling:
-  timestamp_source: Header.stamp
   sample_rate_hz: 2.0
   grid_period_ns: 500000000
-  grid_origin: ceil_first_valid_front_to_period
-  front_grid_tolerance_ns: 50000000
-  side_camera_nearest_tolerance_ns: 30000000
-  lidar_nearest_tolerance_ns: 45000000
-  ego_state_max_bracket_ns: 100000000
-  pose_max_bracket_ns: 100000000
-  nearest_tie_break_order:
-    - absolute_offset_ns
-    - source_stamp_ns
-    - stable_record_index
-  tolerance_boundary_inclusive: true
-  interpolation_exact_match_weight: 0.0
-  interpolation_extrapolation_allowed: false
+  clock_policy:
+    version: 1
+    receipt_clock_semantics: recorder_observation_order_not_acquisition
+    grid:
+      axis: receipt_stamp_ns
+      origin: ceil_first_valid_front_receipt_to_period
+    front:
+      selection_axis: receipt_stamp_ns
+      tolerance_ns: 50000000
+      tie_break_order:
+        - absolute_receipt_offset_ns
+        - receipt_stamp_ns
+        - stable_record_index
+    side_camera:
+      candidate_filters:
+        - axis: header_stamp_ns
+          relative_to: selected_front_header_stamp_ns
+          absolute_tolerance_ns: 30000000
+        - axis: receipt_stamp_ns
+          relative_to: selected_front_receipt_stamp_ns
+          absolute_tolerance_ns: 100000000
+      selection_axis: header_stamp_ns
+      tie_break_order:
+        - absolute_header_offset_ns
+        - header_stamp_ns
+        - stable_record_index
+    lidar:
+      selection_axis: receipt_stamp_ns
+      tolerance_ns: 45000000
+      tie_break_order:
+        - absolute_receipt_offset_ns
+        - receipt_stamp_ns
+        - stable_record_index
+    trajectory_anchor_tf:
+      selection_axis: receipt_stamp_ns
+      tolerance_ns: 50000000
+      tie_break_order:
+        - absolute_receipt_offset_ns
+        - receipt_stamp_ns
+        - stable_record_index
+      current_pose: exact_selected_native_header
+      fallback_to_second_candidate: false
+    ego_state:
+      interpolation_axis: header_stamp_ns
+      target: trajectory_anchor_tf_header_ns
+      max_bracket_ns: 100000000
+    future_pose:
+      interpolation_axis: header_stamp_ns
+      target_origin: trajectory_anchor_tf_header_ns
+      max_bracket_ns: 100000000
+      same_tf_clock_epoch_required: true
+      causal_suffix_from_anchor_required: true
+      extrapolation_allowed: false
+    tf_clock_epoch:
+      ordering:
+        - receipt_stamp_ns
+        - stable_record_index
+      monotonic_header_rule: nondecreasing
+      new_epoch_condition: header_stamp_ns_strictly_decreases
+      equal_header_duplicate_policy: collapse_equivalent_earliest_reject_conflict
+    tf_ego_bag_gate:
+      axis: native_header_stamp_ns
+      scope: full_stream
+    tolerance_boundary_inclusive: true
+    interpolation_exact_match_weight: 0.0
   drop_on_required_sensor_miss: true
 
 camera_processing:
@@ -219,7 +270,12 @@ diagnostics:
   duplicate_tf_rotation_tolerance_rad: 0.000001
 
 cache:
-  schema_version: 1
+  schema_version: 2
+  command_sidecar_schema_version: 2
+  manifest_schema_version: 2
+  hdf5_attributes:
+    cache_schema_version: 2
+    clock_policy_version: 1
   bag_path_template: bags/{domain_id}/{resolved_domain_sha256}/{source_bag_sha256}.h5
   command_path_template: commands/{domain_id}/{resolved_domain_sha256}/{source_bag_sha256}.jsonl
   manifest_path_template: manifests/{domain_id}/{resolved_domain_sha256}/manifest.jsonl
@@ -235,25 +291,39 @@ cache:
     status: {dtype: float32, shape: [N, 8]}
     trajectory: {dtype: float32, shape: [N, 8, 3]}
     timestamp_ns: {dtype: int64, shape: [N]}
-    sensor_source_stamp_ns: {dtype: int64, shape: [N, 4]}
+    grid_receipt_ns: {dtype: int64, shape: [N]}
+    sensor_source_header_stamp_ns: {dtype: int64, shape: [N, 4]}
+    sensor_source_receipt_ns: {dtype: int64, shape: [N, 4]}
     sensor_source_record_index: {dtype: int64, shape: [N, 4]}
-    sensor_sync_offset_ns: {dtype: int64, shape: [N, 3]}
-    ego_bracket_stamp_ns: {dtype: int64, shape: [N, 2]}
+    side_camera_header_offset_ns: {dtype: int64, shape: [N, 2]}
+    sensor_receipt_offset_ns: {dtype: int64, shape: [N, 3]}
+    trajectory_anchor_tf_header_ns: {dtype: int64, shape: [N]}
+    trajectory_anchor_tf_receipt_ns: {dtype: int64, shape: [N]}
+    trajectory_anchor_tf_record_index: {dtype: int64, shape: [N]}
+    trajectory_anchor_tf_clock_epoch_index: {dtype: int64, shape: [N]}
+    ego_bracket_header_stamp_ns: {dtype: int64, shape: [N, 2]}
+    ego_bracket_receipt_ns: {dtype: int64, shape: [N, 2]}
     ego_bracket_record_index: {dtype: int64, shape: [N, 2]}
     ego_interp_weight: {dtype: float32, shape: [N]}
-    pose_bracket_stamp_ns: {dtype: int64, shape: [N, 2]}
-    pose_bracket_record_index: {dtype: int64, shape: [N, 2]}
-    pose_interp_weight: {dtype: float32, shape: [N]}
-    future_pose_bracket_stamp_ns: {dtype: int64, shape: [N, 8, 2]}
+    current_pose_bracket_header_stamp_ns: {dtype: int64, shape: [N, 2]}
+    current_pose_bracket_receipt_ns: {dtype: int64, shape: [N, 2]}
+    current_pose_bracket_record_index: {dtype: int64, shape: [N, 2]}
+    current_pose_interp_weight: {dtype: float32, shape: [N]}
+    future_pose_bracket_header_stamp_ns: {dtype: int64, shape: [N, 8, 2]}
+    future_pose_bracket_receipt_ns: {dtype: int64, shape: [N, 8, 2]}
     future_pose_bracket_record_index: {dtype: int64, shape: [N, 8, 2]}
     future_pose_interp_weight: {dtype: float32, shape: [N, 8]}
   command_record_fields:
+    - schema_version
     - domain_id
     - resolved_domain_sha256
     - sensor_preset_sha256
     - source_bag_sha256
     - command_rule_sha256
     - timestamp_ns
+    - grid_receipt_ns
+    - front_receipt_ns
+    - front_record_index
     - command_index
     - command_name
     - provenance

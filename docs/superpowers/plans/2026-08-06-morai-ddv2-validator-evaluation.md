@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- This is plan 3 of 3. It requires a verified production cache/sidecar/manifest from plan 1 and a preflight-clean exported checkpoint/metadata/profile from plan 2.
+- This is plan 3 of 3. It requires a verified schema-v2 Option D cache/sidecar/manifest from plan 1 and a preflight-clean exported checkpoint/metadata/profile from plan 2. Profile, metadata and manifest must all declare cache schema 2 and clock-policy version 1.
 - Keep `third_party/E2E-OpenLoop-ROS-Validator` clean at `09a3b88e19ae3354903ed676a35e02416284cb58`. Never commit inside the submodule or move its gitlink to a patched commit.
 - Apply the tracked, SHA-256-pinned patch and the one manifest-declared Catkin package symlink only to `.runtime/validator`, which is ignored. Every evaluation report records the base Validator commit, patch SHA-256, authenticated component tree SHA-256, and resulting runtime tree SHA-256.
 - Do not launch `validator_pipeline/launch/openloop_validator.launch`, `validator_inference/launch/openloop_inference.launch`, `image_adaptor.py`, `lidar_bev_processor.py`, `opt_feeder_node.py`, or `0716demo.json` for this domain.
@@ -18,6 +18,7 @@
 - A missing/mismatched metadata file, sensor preset, resolved domain, training manifest, bag hash, sidecar hash/identity/timestamp, or checkpoint state hash is fatal before model construction or sample publication. Never fall back to STRAIGHT or UNKNOWN.
 - ROS camera input is published as HWC `32FC3` `[256,1024,3]` in RGB `[0,1]`; Validator converts it to CHW. LiDAR is `32FC1` `[256,256]` in `[0,1]`. Status is float32 length 8.
 - The published header stamp for camera, LiDAR, and DrivingFeature is the selected front anchor `timestamp_ns`, not the latest received camera or wall time.
+- Runtime input selection is not recomputed. The adapter replays manifest-declared stable record indices and Ego/current/future brackets using per-topic callback counters; observed Header validates the selected record, while exact bag receipt provenance comes from the verified manifest. Callback `rospy.Time.now()` is never a receipt substitute. Nonmonotonic LiDAR pruning uses manifest indices, never timestamp cutoffs.
 - Runtime output is the PDM-free learned selector's final `[8,3]` trajectory. Do not use GT-nearest candidate selection. Heading is the final V2 Bézier-derived heading already returned by the derivative.
 - Project-owned feature/collector nodes run only through the absolute project `.venv-ros/bin/python`; the existing recorder uses its Catkin `/usr/bin/python3` relay; the inference node runs only through Validator `model_env_exec`. The model child receives only its verified `.ros-overlay` and runtime Catkin generated-message path, never the project `src`, `.venv-ros`, `/usr/lib/python3/dist-packages`, or another activated environment.
 - Source only `/opt/ros/noetic/setup.bash` and `.runtime/validator/devel/setup.bash`. `/home/stier/catkin_ws` is not an allowed build or runtime overlay because the runtime clone builds the pinned nested `src/@morai_msgs` gitlink itself.
@@ -146,6 +147,8 @@ class ExportIdentity:
     resolved_domain_sha256: str
     sensor_preset_sha256: str
     training_manifest_sha256: str
+    cache_schema_version: Literal[2]
+    clock_policy_version: Literal[1]
     export_checkpoint_sha256: str
     export_state_dict_sha256: str
     raw_schema_sha256: str
@@ -154,7 +157,7 @@ def verify_export_bundle(profile: Mapping[str, Any], project_root: Path) -> Expo
 ```
 
 - [ ] In a temporary clone of exact Validator commit, write failing tests that prove baseline DDV2 profiles without `checkpoint_metadata` retain existing behavior, while a profile declaring `artifact_identity.domain_id == "morai-ddv2-v1-oracle-command"` requires metadata and all new runtime assets.
-- [ ] Add failure-order spies: existing `verify_runtime_assets` first; required metadata read; profile checkpoint SHA = metadata export-checkpoint SHA = actual checkpoint file SHA; raw state dict exactly 972 keys; canonical tensor-state hash; exact 972-key name/shape schema hash; domain/resolved/sensor/training-manifest identity; only then derivative construction and 971-key strict load. Include same-count renamed-key and changed-shape failures.
+- [ ] Add failure-order spies: existing `verify_runtime_assets` first; required metadata read; profile checkpoint SHA = metadata export-checkpoint SHA = actual checkpoint file SHA; raw state dict exactly 972 keys; canonical tensor-state hash; exact 972-key name/shape schema hash; domain/resolved/sensor/training-manifest plus cache-schema-2/clock-policy-1 identity; only then derivative construction and 971-key strict load. Include same-count renamed-key and changed-shape failures.
 - [ ] Implement both `state_dict_sha256` and `state_schema_sha256` exactly as plan 2 and test them against its shared golden vectors. The patch must not use Validator's sorted-JSON `profile_sha256` as a substitute for RFC 8785 artifact identity.
 - [ ] Call `verify_export_bundle` from `DiffusionDriveV2InferenceModel.load()` after existing asset verification and before `_DiffusionDriveSelectorRuntime` construction. Return `None` only for baseline profiles with no MORAI artifact identity; any partially declared MORAI identity is fatal.
 
@@ -350,8 +353,16 @@ git commit -m "feat: add MORAI Validator catkin adapter"
 @dataclass(frozen=True)
 class RuntimeAnchor:
     timestamp_ns: int
+    grid_receipt_ns: int
+    manifest_sample: SampleManifestRecord
     command: Command
     sidecar_record: CommandRecord
+
+@dataclass(frozen=True)
+class CallbackRecord(Generic[T]):
+    header_stamp_ns: int
+    stable_record_index: int
+    value: T
 
 @dataclass(frozen=True)
 class RuntimeTensorSample:
@@ -359,30 +370,35 @@ class RuntimeTensorSample:
     camera_chw: np.ndarray
     lidar_chw: np.ndarray
     status: np.ndarray
-    source_stamps_ns: tuple[int, int, int, int]
-    source_indices: tuple[int, int, int, int]
+    sensor_source_header_stamp_ns: tuple[int, int, int, int]
+    sensor_source_receipt_ns: tuple[int, int, int, int]
+    sensor_source_record_index: tuple[int, int, int, int]
+    trajectory_anchor_tf_clock_epoch_index: int
 
 class AnchorCoordinator:
-    def ingest_camera(self, view: str, record: StampedRecord[bytes]) -> None
-    def ingest_lidar(self, record: StampedRecord[np.ndarray]) -> None
-    def ingest_ego(self, record: StampedRecord[EgoValue]) -> None
-    def ingest_tf(self, record: StampedRecord[Extrinsic]) -> None
+    def ingest_camera(self, view: str, record: CallbackRecord[bytes]) -> None
+    def ingest_lidar(self, record: CallbackRecord[np.ndarray]) -> None
+    def ingest_ego(self, record: CallbackRecord[EgoValue]) -> None
+    def ingest_tf(self, record: CallbackRecord[Extrinsic]) -> None
     def try_build_next(self) -> RuntimeTensorSample | None
     def mark_inference_completed(self, timestamp_ns: int) -> None
 ```
 
-- [ ] Write tests loading a verified command sidecar and manifest identity before accepting messages. Wrong bag hash, sidecar hash/count, domain/resolved/preset/command-rule identity, duplicate/missing anchor, or unrecognized command index is fatal.
-- [ ] Feed out-of-order fake records and prove selection delegates to the shared timestamp/camera/LiDAR/Ego/status functions. The front source must exactly match sidecar anchor; left/right are nearest within 30 ms; LiDAR within 45 ms; Ego is bracket-only within 100 ms.
+- [ ] Write tests loading a verified schema-v2 command sidecar and manifest identity before accepting messages. Wrong bag hash, sidecar hash/count, domain/resolved/preset/command-rule/cache-schema/clock-policy identity, duplicate/missing anchor, sidecar front receipt/index mismatch, or unrecognized command index is fatal.
+- [ ] Feed callback records with misleading callback time/Header-nearest alternatives and prove no runtime nearest search occurs. Per-topic callback counters must select the exact manifest indices for front/left/right/LiDAR, the exact Ego bracket indices, exact current TF and all future TF bracket indices. Observed Headers must equal manifest provenance; receipt values and float32 weights come from HDF5/manifest and are never reconstructed from callback time. `/tf` counters flatten every TransformStamped. Callback `rospy.Time.now()` and Header may validate the record but can never change selection.
+- [ ] Add the Option D parity fixture where the Header-nearest side first candidate violates receipt 100 ms and the manifest-selected second candidate is replayed. Add a TF Header reset fixture and require all future bracket indices to stay in the manifest anchor epoch and receipt-order causal suffix. Runtime never constructs an affine bridge.
 - [ ] Require canonical sensor extrinsics from `/tf` to match resolved domain before the first sample. Runtime does not recompute future GT trajectory; the verified future-derived sidecar supplies command, and HDF5 supplies GT later for reporting.
-- [ ] Allow one published/in-flight anchor only. Do not advance or drop buffered records until matching `inference_completed`; reject completion for another stamp. After completion, prune only records provably older than the next anchor's selection/bracket window.
+- [ ] Allow one published/in-flight anchor only. Do not advance or drop buffered records until matching `inference_completed`; reject completion for another stamp. After completion, compute each topic's minimum stable index still required by the next manifest anchor and prune only lower indices. In particular, LiDAR Header backsteps must not retain or delete records by Header/receipt cutoff.
 
 ```python
 def try_build_next(self):
     if self._in_flight_timestamp_ns is not None or self._next_index == len(self._anchors):
         return None
     anchor = self._anchors[self._next_index]
-    selected = self._selector.select_runtime_inputs(anchor.timestamp_ns, self._buffers)
-    if selected is None:
+    selected = self._manifest_replay.collect_exact_records(
+        anchor.manifest_sample, self._buffers
+    )
+    if selected is None:  # one or more exact callback indices are not buffered yet
         return None
     command = lookup_oracle_command(
         self._sidecar,
@@ -396,7 +412,7 @@ def try_build_next(self):
 ```
 
 - [ ] Run `.venv-ros/bin/python -m pytest tests/unit/validator/test_coordinator.py tests/unit/validator/test_sidecar_runtime.py -q`. Expected: FAIL.
-- [ ] Implement finite/shape/range checks immediately before returning a sample; no UNKNOWN/STRAIGHT fallback and no interpolation/extrapolation different from plan 1.
+- [ ] Implement finite/shape/range and exact manifest-provenance checks immediately before returning a sample; no UNKNOWN/STRAIGHT fallback, nearest reselection, bracket recomputation, interpolation/extrapolation, or clock-axis choice different from plan 1.
 - [ ] Run `.venv-ros/bin/python -m pytest tests/unit/validator/test_coordinator.py tests/unit/validator/test_sidecar_runtime.py -q`. Expected: PASS.
 - [ ] Commit.
 
@@ -514,7 +530,7 @@ def wait_for_required_ros_graph(master_uri: str, timeout_s: float) -> None
 def wait_for_recorder_barrier(csv_dir: Path, expected_timestamps_ns: Sequence[int], timeout_s: float) -> Path
 ```
 
-- [ ] Test preflight before any ROS process creation: production manifest, bag path/hash/split, sidecar path/hash/count/identity, profile/export metadata/state hash/raw-schema hash, sensor/resolved hashes, exact patch/component/runtime tree identity, ROS package build, fixed IDs, GPU availability, and output nonexistence. Run `[str(request.runtime_root / "openloop"), "verify", "diffusiondrive_v2"]` and require zero exit before allocating a ROS master; `catkin_make` or directory existence is not a model-environment substitute.
+- [ ] Test preflight before any ROS process creation: schema-v2 production manifest/HDF5/sidecar with complete Option D provenance, bag path/hash/split, sidecar path/hash/count/identity, profile/export metadata/state hash/raw-schema/cache-schema/clock-policy identity, sensor/resolved hashes, exact patch/component/runtime tree identity, ROS package build, fixed IDs, GPU availability, and output nonexistence. Run `[str(request.runtime_root / "openloop"), "verify", "diffusiondrive_v2"]` and require zero exit before allocating a ROS master; `catkin_make` or directory existence is not a model-environment substitute.
 - [ ] Test argv allowlist. ROS launch uses absolute project root, `.venv-ros` interpreter, project `src`, `profile_file`, runtime root/model environment root, `model_id=diffusiondrive_v2`, fixed run ID, unique empty recorder directory, bag/sidecar/manifest parameters, checkpoint metadata path, and patch/component/runtime hashes. Assert fixed node names and absolute processed/output topics, and assert forbidden substrings are absent: `openloop_validator.launch`, `openloop_inference.launch`, `image_adaptor.py`, `lidar_bev_processor.py`, `opt_feeder_node.py`, `0716demo.json`, `/home/stier/catkin_ws`.
 - [ ] Build bag playback exactly with simulated clock, subscriber readiness, rate-control heartbeat, and required raw topics:
 
@@ -534,6 +550,7 @@ def build_rosbag_play_argv(request):
 ```
 
 - [ ] Test `geometry_msgs/PointStamped` rate-control integration with a fake simulated clock: zero-time heartbeats are suppressed, stamped heartbeats keep playback within the 0.2 s bag-time window while raw data is needed, heartbeat silence pauses it during inference, and matching completion resumes it.
+- [ ] Simulated `/clock` controls playback only. Do not infer or reselect bag receipt provenance from callback `rospy.Time.now()`, whose publication cadence need not equal every record receipt. Per-topic callback counters identify the manifest-required record, the message validates its Header, and the verified manifest supplies that record's exact `receipt_stamp_ns` provenance. Receipt is never described as acquisition time.
 - [ ] For every single-bag run, allocate an unused loopback port by binding `127.0.0.1:0`, release it immediately before spawning `subprocess.Popen(["roscore", "-p", str(lease.port)], env=child_env, start_new_session=True)`, and retry allocation if `roscore` loses that bind race. Set `ROS_MASTER_URI=f"http://127.0.0.1:{lease.port}/"` and `ROS_HOSTNAME="127.0.0.1"` in `child_env` for `roscore`, roslaunch, rosbag, readiness/service clients, and monitoring code. Never attach to an ambient master.
 - [ ] Test `wait_for_required_ros_graph` against fake master states. Before rosbag may start, require `/inference_engine` to subscribe to `/image/diffusiondrive_v2/processed`, `/lidar/diffusiondrive_v2/processed`, and `/driving_feature`; require `/inference_engine` to publish `/waypoints` to `/morai_prediction_collector`; and require its non-latched `/inference_metric` publisher to have `/recorder`, `/morai_prediction_collector`, and `/morai_oracle_feature` as subscribers. A missing or renamed edge must time out before any raw message is played.
 - [ ] Launcher order is exact: run all preflights including `openloop verify`; create the unique empty recorder directory; start the private `roscore`; start roslaunch; wait for `/morai_ddv2/ready` to return success, which proves the model loaded and all three processed-topic engine subscriptions exist; wait for the complete input/output graph above, which prevents loss of the first non-latched path/metric; then start rosbag. The feature node independently refuses publication if any processed-input connection disappears.
@@ -568,7 +585,7 @@ def compare_offline_ros_predictions(offline: Sequence[PredictionRecord], ros: Se
 - [ ] Reuse plan 2 metric functions for sample-micro ADE, FDE, circular heading MAE, bag-macro ADE, and per-command results. Report `count=0, metric=null`, never NaN, and label domain/oracle command explicitly.
 - [ ] Verify each completed CSV row has the expected run/model/profile/calibration hashes and the seed recomputed from stamp. Record not-ready/busy counts separately; under `new_stamp_once`, each expected timestamp has exactly one completion.
 - [ ] Test offline/ROS parity: identical status/input tensors must be exact; selected prediction may differ only by the documented Path float/transform round-trip tolerance `atol=1e-5`; metrics must agree within `1e-6`.
-- [ ] Publish canonical JSON report atomically and include all bag/cache/checkpoint/profile/patch identities, command counts, sync/drop statistics, timings, and parity result.
+- [ ] Publish canonical JSON report atomically and include all bag/cache-schema/clock-policy/checkpoint/profile/patch identities, command counts, separate side Header/sensor receipt/TF-anchor receipt/TF-epoch/drop statistics, timings, and parity result. Never combine Header and receipt deltas into one sync statistic.
 - [ ] Run `.venv-train/bin/python -m pytest tests/unit/validator/test_report.py tests/unit/validator/test_offline_ros_comparison.py -q`. Expected: FAIL, then PASS.
 - [ ] Commit.
 
@@ -590,8 +607,9 @@ git commit -m "feat: report MORAI ROS open-loop metrics"
 - For one selected real-bag anchor, offline cache and ROS adapter use the same raw source records and produce exact camera, LiDAR, and status tensors.
 - Source stamp/index provenance is identical to the HDF5 row.
 
-- [ ] Add a synthetic callback-order integration test with JPEG and PointCloud fixtures. Feed records through the node coordinator in bag order and compare its published decoded arrays to `materialize_samples`; require bit-exact camera/status and LiDAR counts/model float values.
-- [ ] Add an opt-in real-bag parity test keyed by `MORAI_REAL_BAG`, `MORAI_CACHE_MANIFEST`, and `MORAI_RESOLVED_DOMAIN`. Choose the first manifest sample from that bag, replay raw messages through coordinator callbacks without ROS master, and compare exact tensors/stamps/indices to HDF5.
+- [ ] Add a synthetic callback-order integration test with JPEG and PointCloud fixtures. Feed records through the node coordinator in bag order and compare its published decoded arrays to `materialize_samples`; require bit-exact camera/status and LiDAR counts/model float values plus exact Header/receipt/index/TF-epoch/bracket provenance. Perturb callback now and provide a closer unselected Header candidate; outputs and selected indices must remain unchanged because replay follows manifest counters.
+- [ ] Include nonmonotonic LiDAR Header and TF-reset cases. Prove pruning follows the next manifest-required stable index, the side dual-bound second candidate is preserved, and future brackets never cross the cached TF epoch.
+- [ ] Add an opt-in real-bag parity test keyed by `MORAI_REAL_BAG`, `MORAI_CACHE_MANIFEST`, and `MORAI_RESOLVED_DOMAIN`. Choose the first manifest sample from that bag, replay raw messages through coordinator callbacks without ROS master, and compare exact tensors, Header/receipt stamps, stable indices, trajectory anchor and all cached brackets to HDF5.
 - [ ] Assert source bag stat and every artifact hash are unchanged before/after.
 - [ ] If shared preprocessing changed, run `.venv-ros/bin/python -m pytest tests/unit/preprocess/test_timestamps.py tests/unit/preprocess/test_geometry.py tests/unit/preprocess/test_camera.py tests/unit/preprocess/test_lidar.py tests/unit/preprocess/test_planner.py tests/unit/preprocess/test_materialize.py -q`. Expected: PASS.
 - [ ] Run:
@@ -738,7 +756,7 @@ git commit -m "test: accept held-out MORAI Validator evaluation"
 | Metadata/file/state/domain identity before model load | Task 2 |
 | One inference per anchor, unchanged baseline behavior | Task 3 |
 | Separate ROS/model environments and MORAI-only launch | Task 4 |
-| Shared timestamp/camera/LiDAR/Ego/status/sidecar logic | Tasks 5–6 |
+| Manifest-replayed Option D records, camera/LiDAR/Ego/status/sidecar | Tasks 5–6 |
 | Exact HWC/CHW tensor messages and no fallback command | Task 6 |
 | Learned-selector `[8,3]` Path round-trip | Task 7 |
 | Rate-controlled raw bag playback and fail-fast launch | Task 8 |

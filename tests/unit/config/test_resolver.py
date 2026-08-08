@@ -55,8 +55,92 @@ def test_domain_yaml_contains_policy_but_not_preset_owned_sensor_values(repo_roo
         "ego_state": "morai_msgs/EgoVehicleStatus",
         "transforms": "tf2_msgs/TFMessage",
     }
-    assert raw_domain["sampling"]["sample_rate_hz"] == 2.0
-    assert raw_domain["sampling"]["grid_period_ns"] == 500_000_000
+    sampling = raw_domain["sampling"]
+    assert "timestamp_source" not in sampling
+    assert sampling["sample_rate_hz"] == 2.0
+    assert sampling["grid_period_ns"] == 500_000_000
+    assert sampling["clock_policy"] == {
+        "version": 1,
+        "receipt_clock_semantics": "recorder_observation_order_not_acquisition",
+        "grid": {
+            "axis": "receipt_stamp_ns",
+            "origin": "ceil_first_valid_front_receipt_to_period",
+        },
+        "front": {
+            "selection_axis": "receipt_stamp_ns",
+            "tolerance_ns": 50_000_000,
+            "tie_break_order": [
+                "absolute_receipt_offset_ns",
+                "receipt_stamp_ns",
+                "stable_record_index",
+            ],
+        },
+        "side_camera": {
+            "candidate_filters": [
+                {
+                    "axis": "header_stamp_ns",
+                    "relative_to": "selected_front_header_stamp_ns",
+                    "absolute_tolerance_ns": 30_000_000,
+                },
+                {
+                    "axis": "receipt_stamp_ns",
+                    "relative_to": "selected_front_receipt_stamp_ns",
+                    "absolute_tolerance_ns": 100_000_000,
+                },
+            ],
+            "selection_axis": "header_stamp_ns",
+            "tie_break_order": [
+                "absolute_header_offset_ns",
+                "header_stamp_ns",
+                "stable_record_index",
+            ],
+        },
+        "lidar": {
+            "selection_axis": "receipt_stamp_ns",
+            "tolerance_ns": 45_000_000,
+            "tie_break_order": [
+                "absolute_receipt_offset_ns",
+                "receipt_stamp_ns",
+                "stable_record_index",
+            ],
+        },
+        "trajectory_anchor_tf": {
+            "selection_axis": "receipt_stamp_ns",
+            "tolerance_ns": 50_000_000,
+            "tie_break_order": [
+                "absolute_receipt_offset_ns",
+                "receipt_stamp_ns",
+                "stable_record_index",
+            ],
+            "current_pose": "exact_selected_native_header",
+            "fallback_to_second_candidate": False,
+        },
+        "ego_state": {
+            "interpolation_axis": "header_stamp_ns",
+            "target": "trajectory_anchor_tf_header_ns",
+            "max_bracket_ns": 100_000_000,
+        },
+        "future_pose": {
+            "interpolation_axis": "header_stamp_ns",
+            "target_origin": "trajectory_anchor_tf_header_ns",
+            "max_bracket_ns": 100_000_000,
+            "same_tf_clock_epoch_required": True,
+            "causal_suffix_from_anchor_required": True,
+            "extrapolation_allowed": False,
+        },
+        "tf_clock_epoch": {
+            "ordering": ["receipt_stamp_ns", "stable_record_index"],
+            "monotonic_header_rule": "nondecreasing",
+            "new_epoch_condition": "header_stamp_ns_strictly_decreases",
+            "equal_header_duplicate_policy": "collapse_equivalent_earliest_reject_conflict",
+        },
+        "tf_ego_bag_gate": {
+            "axis": "native_header_stamp_ns",
+            "scope": "full_stream",
+        },
+        "tolerance_boundary_inclusive": True,
+        "interpolation_exact_match_weight": 0.0,
+    }
     assert raw_domain["camera_processing"]["output_wh"] == [1024, 256]
     assert raw_domain["lidar_processing"]["bins_xy"] == [256, 256]
     assert raw_domain["trajectory"]["sampling_offsets_ns"][-1] == 4_000_000_000
@@ -68,7 +152,67 @@ def test_domain_yaml_contains_policy_but_not_preset_owned_sensor_values(repo_roo
         "STRAIGHT",
         "UNKNOWN_AMBIGUOUS",
     ]
-    assert raw_domain["cache"]["schema_version"] == 1
+    cache = raw_domain["cache"]
+    assert cache["schema_version"] == 2
+    assert cache["command_sidecar_schema_version"] == 2
+    assert cache["manifest_schema_version"] == 2
+    assert cache["hdf5_attributes"] == {
+        "cache_schema_version": 2,
+        "clock_policy_version": 1,
+    }
+    assert cache["datasets"] == {
+        "camera_rgb": {"dtype": "uint8", "shape": ["N", 256, 1024, 3]},
+        "lidar_count": {"dtype": "uint8", "shape": ["N", 256, 256]},
+        "status": {"dtype": "float32", "shape": ["N", 8]},
+        "trajectory": {"dtype": "float32", "shape": ["N", 8, 3]},
+        "timestamp_ns": {"dtype": "int64", "shape": ["N"]},
+        "grid_receipt_ns": {"dtype": "int64", "shape": ["N"]},
+        "sensor_source_header_stamp_ns": {"dtype": "int64", "shape": ["N", 4]},
+        "sensor_source_receipt_ns": {"dtype": "int64", "shape": ["N", 4]},
+        "sensor_source_record_index": {"dtype": "int64", "shape": ["N", 4]},
+        "side_camera_header_offset_ns": {"dtype": "int64", "shape": ["N", 2]},
+        "sensor_receipt_offset_ns": {"dtype": "int64", "shape": ["N", 3]},
+        "trajectory_anchor_tf_header_ns": {"dtype": "int64", "shape": ["N"]},
+        "trajectory_anchor_tf_receipt_ns": {"dtype": "int64", "shape": ["N"]},
+        "trajectory_anchor_tf_record_index": {"dtype": "int64", "shape": ["N"]},
+        "trajectory_anchor_tf_clock_epoch_index": {"dtype": "int64", "shape": ["N"]},
+        "ego_bracket_header_stamp_ns": {"dtype": "int64", "shape": ["N", 2]},
+        "ego_bracket_receipt_ns": {"dtype": "int64", "shape": ["N", 2]},
+        "ego_bracket_record_index": {"dtype": "int64", "shape": ["N", 2]},
+        "ego_interp_weight": {"dtype": "float32", "shape": ["N"]},
+        "current_pose_bracket_header_stamp_ns": {
+            "dtype": "int64",
+            "shape": ["N", 2],
+        },
+        "current_pose_bracket_receipt_ns": {"dtype": "int64", "shape": ["N", 2]},
+        "current_pose_bracket_record_index": {"dtype": "int64", "shape": ["N", 2]},
+        "current_pose_interp_weight": {"dtype": "float32", "shape": ["N"]},
+        "future_pose_bracket_header_stamp_ns": {
+            "dtype": "int64",
+            "shape": ["N", 8, 2],
+        },
+        "future_pose_bracket_receipt_ns": {"dtype": "int64", "shape": ["N", 8, 2]},
+        "future_pose_bracket_record_index": {
+            "dtype": "int64",
+            "shape": ["N", 8, 2],
+        },
+        "future_pose_interp_weight": {"dtype": "float32", "shape": ["N", 8]},
+    }
+    assert cache["command_record_fields"] == [
+        "schema_version",
+        "domain_id",
+        "resolved_domain_sha256",
+        "sensor_preset_sha256",
+        "source_bag_sha256",
+        "command_rule_sha256",
+        "timestamp_ns",
+        "grid_receipt_ns",
+        "front_receipt_ns",
+        "front_record_index",
+        "command_index",
+        "command_name",
+        "provenance",
+    ]
     assert raw_domain["split"]["seed_prefix"] == "20260806:"
 
 
