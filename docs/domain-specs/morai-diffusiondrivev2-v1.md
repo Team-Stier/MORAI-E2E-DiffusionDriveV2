@@ -194,7 +194,7 @@ tf_ego_heading_p99_tolerance_deg: 0.5
 8. 선택 raw TF anchor부터 시작하는 same-epoch causal suffix interpolation view에서만 native Header `T0+0.5,...,T0+4.0 s`를 translation 선형 보간과 quaternion SLERP로 보간한다.
 9. 어느 필수 값이라도 없거나 비유한 값이면 sample을 생성하지 않는다.
 
-한 raw 메시지는 여러 anchor에 재사용할 수 있지만 sample metadata에는 실제 Header, receipt와 stable record index를 모두 기록해야 한다. Ego 또는 future-pose bracket 간격이 100 ms를 넘으면 sample을 drop해야 한다. source 앞이나 뒤로 extrapolation하거나 TF clock epoch/reset을 넘으면 안 된다. nearest 후보가 이후 validation을 통과하지 못해도 두 번째 후보를 고르는 fallback은 금지한다.
+selected front를 제외한 side-camera/LiDAR/Ego/TF raw record는 여러 receipt-grid anchor에 재사용할 수 있지만 sample metadata에는 실제 Header, receipt와 stable record index를 모두 기록해야 한다. selected front stable record와 selected front Header는 각각 하나의 receipt-grid anchor에만 대응해야 하며, record 재사용이나 Header 중복은 bag-level `FRONT_TIMESTAMP_ORDER_VIOLATION`으로 거부한다. Ego 또는 future-pose bracket 간격이 100 ms를 넘으면 sample을 drop해야 한다. source 앞이나 뒤로 extrapolation하거나 TF clock epoch/reset을 넘으면 안 된다. nearest 후보가 이후 validation을 통과하지 못해도 두 번째 후보를 고르는 fallback은 금지한다.
 
 ## 5. Camera feature
 
