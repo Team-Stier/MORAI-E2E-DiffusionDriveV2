@@ -180,6 +180,11 @@ def construct_pdm_free_sel_network(
     contracts = _validator_contracts(assets.validator_root)
     contracts.prepend_source_path(checkout)
     config_module = importlib.import_module(SEL_CONFIG_MODULE)
+    contracts.require_module_from_checkout(
+        config_module,
+        checkout,
+        f"{SEL_CONFIG_MODULE}.TransfuserConfig",
+    )
     model_module = importlib.import_module(PDM_FREE_SEL_MODULE)
     contracts.require_module_from_checkout(model_module, checkout, PDM_FREE_SEL_SYMBOL)
 

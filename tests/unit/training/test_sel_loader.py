@@ -245,6 +245,48 @@ def test_construct_network_imports_only_pdm_free_derivative_and_sets_assets(
     assert "navsim.agents.diffusiondrivev2.diffusiondrivev2_model_sel" not in requested
 
 
+def test_construct_network_rejects_stale_config_from_another_checkout(
+    repo_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint = _touch_asset(tmp_path / "official.ckpt")
+    assets = _assets(repo_root, tmp_path, checkpoint)
+    derivative = _touch_asset(
+        assets.v2_checkout
+        / "navsim/agents/diffusiondrivev2/diffusiondrivev2_model_sel_inference.py"
+    )
+    stale_config_path = _touch_asset(
+        tmp_path
+        / "stale-checkout/navsim/agents/diffusiondrivev2/diffusiondrivev2_sel_config.py"
+    )
+    config_module = ModuleType("stale_sel_config")
+    config_module.__file__ = str(stale_config_path)
+    config_module.TransfuserConfig = FakeTransfuserConfig
+    model_module = ModuleType("pinned_sel_inference")
+    model_module.__file__ = str(derivative)
+    model_module.V2TransfuserModel = CapturingSelModel
+    real_import_module = importlib.import_module
+
+    def import_module(name: str):
+        if name == "navsim.agents.diffusiondrivev2.diffusiondrivev2_sel_config":
+            return config_module
+        if name == (
+            "navsim.agents.diffusiondrivev2.diffusiondrivev2_model_sel_inference"
+        ):
+            return model_module
+        return real_import_module(name)
+
+    monkeypatch.setattr(ddv2_sel.importlib, "import_module", import_module)
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            r"diffusiondrivev2_sel_config\.TransfuserConfig resolved outside "
+            r"pinned checkout"
+        ),
+    ):
+        construct_pdm_free_sel_network(assets, torch.device("cpu"))
+
+
 def test_validator_loader_must_resolve_from_selected_pinned_root(
     repo_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
