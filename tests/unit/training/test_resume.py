@@ -1,0 +1,748 @@
+from __future__ import annotations
+
+from collections import OrderedDict
+from dataclasses import replace
+import gc
+from pathlib import Path
+import random
+import socket
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, Dataset
+
+from morai_ddv2.training.checkpoint import (
+    load_training_checkpoint,
+    save_training_checkpoint,
+)
+from morai_ddv2.training.contracts import (
+    EpochAccumulatorState,
+    StepMetrics,
+)
+from morai_ddv2.training.freeze import (
+    build_optimizer,
+    configure_training_boundary,
+    extract_mutable_state,
+)
+from morai_ddv2.training.loss import snapshot_source_parameters
+from morai_ddv2.training.rng import (
+    capture_rng_state,
+    create_dataloader_iterator,
+    restore_rng_state,
+)
+from morai_ddv2.training.sampler import StatefulPermutationSampler
+from morai_ddv2.training.trainer import train_one_epoch, train_step
+
+
+class _ResumeDataset(Dataset):
+    def __init__(self, size: int = 8) -> None:
+        self._size = size
+
+    def __len__(self) -> int:
+        return self._size
+
+    def __getitem__(self, index: int):
+        value = float(index + 1)
+        return {
+            "features": {
+                "x": torch.tensor([value, value * value], dtype=torch.float32)
+            },
+            "trajectory": torch.tensor(
+                [value * 0.25, -value * 0.5], dtype=torch.float32
+            ),
+            "metadata": {"sample_id": "sample-{:02d}".format(index)},
+        }
+
+
+class _ResumeModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self._backbone = nn.Module()
+        self._backbone.image_encoder = nn.Sequential(
+            OrderedDict(
+                (
+                    ("projection", nn.Linear(2, 2, bias=False)),
+                    ("norm", nn.BatchNorm1d(2)),
+                )
+            )
+        )
+        self.frozen_head = nn.Linear(2, 2, bias=False)
+
+
+def _zero_accumulator() -> EpochAccumulatorState:
+    return EpochAccumulatorState(
+        epoch=0,
+        completed_batches=0,
+        completed_samples=0,
+        total_loss_numerator=0.0,
+        trajectory_loss_numerator=0.0,
+        preservation_loss_numerator=0.0,
+        grad_norm_sum=0.0,
+        grad_norm_count=0,
+    )
+
+
+def _advance_accumulator(
+    state: EpochAccumulatorState,
+    metrics: StepMetrics,
+    batch_size: int,
+) -> EpochAccumulatorState:
+    assert metrics.optimizer_step_applied
+    return replace(
+        state,
+        completed_batches=state.completed_batches + 1,
+        completed_samples=state.completed_samples + batch_size,
+        total_loss_numerator=(
+            state.total_loss_numerator + metrics.total_loss * batch_size
+        ),
+        trajectory_loss_numerator=(
+            state.trajectory_loss_numerator + metrics.trajectory_loss * batch_size
+        ),
+        preservation_loss_numerator=(
+            state.preservation_loss_numerator + metrics.preservation_loss * batch_size
+        ),
+        grad_norm_sum=state.grad_norm_sum + metrics.grad_norm,
+        grad_norm_count=state.grad_norm_count + 1,
+    )
+
+
+def _assert_nested_equal(left, right) -> None:
+    if isinstance(left, torch.Tensor):
+        assert isinstance(right, torch.Tensor)
+        assert torch.equal(left, right)
+    elif isinstance(left, dict):
+        assert isinstance(right, dict)
+        assert left.keys() == right.keys()
+        for key in left:
+            _assert_nested_equal(left[key], right[key])
+    elif isinstance(left, (list, tuple)):
+        assert type(left) is type(right)
+        assert len(left) == len(right)
+        for left_item, right_item in zip(left, right):
+            _assert_nested_equal(left_item, right_item)
+    else:
+        assert left == right
+
+
+def _assert_nested_close(left, right) -> None:
+    if isinstance(left, torch.Tensor):
+        assert isinstance(right, torch.Tensor)
+        torch.testing.assert_close(left, right, rtol=1.0e-6, atol=1.0e-7)
+    elif isinstance(left, dict):
+        assert isinstance(right, dict)
+        assert left.keys() == right.keys()
+        for key in left:
+            _assert_nested_close(left[key], right[key])
+    elif isinstance(left, (list, tuple)):
+        assert type(left) is type(right)
+        assert len(left) == len(right)
+        for left_item, right_item in zip(left, right):
+            _assert_nested_close(left_item, right_item)
+    else:
+        assert left == right
+
+
+def _assert_rng_equal(left, right) -> None:
+    assert left.python == right.python
+    assert left.numpy[0] == right.numpy[0]
+    assert np.array_equal(left.numpy[1], right.numpy[1])
+    assert left.numpy[2:] == right.numpy[2:]
+    assert torch.equal(left.torch_cpu, right.torch_cpu)
+    assert len(left.torch_cuda) == len(right.torch_cuda)
+    assert all(
+        torch.equal(left_state, right_state)
+        for left_state, right_state in zip(left.torch_cuda, right.torch_cuda)
+    )
+    assert torch.equal(left.dataloader_cpu, right.dataloader_cpu)
+    assert torch.equal(
+        left.dataloader_iterator_base_cpu,
+        right.dataloader_iterator_base_cpu,
+    )
+
+
+def _new_training_objects(
+    *,
+    num_workers: int,
+    device: torch.device = torch.device("cpu"),
+):
+    torch.manual_seed(700)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(700)
+    model = _ResumeModel().to(device)
+    manifest = configure_training_boundary(model)
+    reference = snapshot_source_parameters(model, manifest)
+    optimizer = build_optimizer(model, manifest, lr=1.0e-3, weight_decay=1.0e-4)
+    scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
+    dataset = _ResumeDataset()
+    sampler = StatefulPermutationSampler(dataset, seed=701)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(702)
+    loader = DataLoader(
+        dataset,
+        batch_size=2,
+        sampler=sampler,
+        num_workers=num_workers,
+        prefetch_factor=2 if num_workers else None,
+        generator=generator,
+        persistent_workers=False,
+    )
+    return model, manifest, reference, optimizer, scaler, sampler, generator, loader
+
+
+def _install_stochastic_fake(monkeypatch: pytest.MonkeyPatch) -> None:
+    from morai_ddv2.training import trainer as trainer_module
+
+    def fake_forward(model, features, target):
+        device = next(model.parameters()).device
+        output = model._backbone.image_encoder(features["x"].to(device))
+        target = target.to(device)
+        random_factor = random.random() + float(np.random.random_sample())
+        random_factor += float(torch.rand((), device=device))
+        loss = (output - target).square().mean()
+        loss = loss + output.mean() * (1.0e-3 * random_factor)
+        return SimpleNamespace(trajectory_loss=loss)
+
+    monkeypatch.setattr(
+        trainer_module,
+        "forward_trajectory_supervised",
+        fake_forward,
+    )
+
+
+def _run_steps(
+    *,
+    iterator,
+    count,
+    model,
+    optimizer,
+    scaler,
+    reference,
+    manifest,
+    sampler,
+    accumulator,
+    global_step,
+    amp=False,
+):
+    sample_ids = []
+    for _ in range(count):
+        batch = next(iterator)
+        sample_ids.extend(batch["metadata"]["sample_id"])
+        metrics = train_step(
+            model,
+            batch,
+            optimizer,
+            scaler,
+            reference,
+            manifest,
+            amp=amp,
+            grad_clip_norm=1.0,
+            trajectory_weight=12.0,
+            preservation_weight=1.0e-3,
+        )
+        assert metrics.optimizer_step_applied
+        batch_size = int(batch["trajectory"].shape[0])
+        sampler.mark_consumed(batch_size)
+        accumulator = _advance_accumulator(accumulator, metrics, batch_size)
+        global_step += 1
+    return accumulator, global_step, sample_ids
+
+
+def _worker_prefetch_supported() -> bool:
+    probe = None
+    try:
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    except OSError:
+        return False
+    finally:
+        if probe is not None:
+            probe.close()
+    return True
+
+
+def _assert_mid_epoch_resume_exact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    num_workers: int,
+    device: torch.device,
+    explicit_run_ahead: bool,
+) -> None:
+    _install_stochastic_fake(monkeypatch)
+
+    random.seed(703)
+    np.random.seed(704)
+    torch.manual_seed(705)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(705)
+    (
+        full_model,
+        full_manifest,
+        full_reference,
+        full_optimizer,
+        full_scaler,
+        full_sampler,
+        full_generator,
+        full_loader,
+    ) = _new_training_objects(num_workers=num_workers, device=device)
+    full_iterator, full_base = create_dataloader_iterator(full_loader, full_generator)
+    full_accumulator, full_global_step, full_ids = _run_steps(
+        iterator=full_iterator,
+        count=4,
+        model=full_model,
+        optimizer=full_optimizer,
+        scaler=full_scaler,
+        reference=full_reference,
+        manifest=full_manifest,
+        sampler=full_sampler,
+        accumulator=_zero_accumulator(),
+        global_step=0,
+        amp=device.type == "cuda",
+    )
+    full_rng = capture_rng_state(
+        full_generator,
+        dataloader_iterator_base_cpu=full_base,
+    )
+
+    random.seed(703)
+    np.random.seed(704)
+    torch.manual_seed(705)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(705)
+    (
+        interrupted_model,
+        interrupted_manifest,
+        interrupted_reference,
+        interrupted_optimizer,
+        interrupted_scaler,
+        interrupted_sampler,
+        interrupted_generator,
+        interrupted_loader,
+    ) = _new_training_objects(num_workers=num_workers, device=device)
+    interrupted_iterator, interrupted_base = create_dataloader_iterator(
+        interrupted_loader, interrupted_generator
+    )
+    if explicit_run_ahead:
+        prefetched_batches = [next(interrupted_iterator) for _ in range(4)]
+        committed_iterator = iter(prefetched_batches)
+    else:
+        prefetched_batches = None
+        committed_iterator = interrupted_iterator
+    interrupted_accumulator, interrupted_global_step, first_ids = _run_steps(
+        iterator=committed_iterator,
+        count=2,
+        model=interrupted_model,
+        optimizer=interrupted_optimizer,
+        scaler=interrupted_scaler,
+        reference=interrupted_reference,
+        manifest=interrupted_manifest,
+        sampler=interrupted_sampler,
+        accumulator=_zero_accumulator(),
+        global_step=0,
+        amp=device.type == "cuda",
+    )
+    saved_rng = capture_rng_state(
+        interrupted_generator,
+        dataloader_iterator_base_cpu=interrupted_base,
+    )
+    checkpoint_path = tmp_path / "last.pt"
+    save_training_checkpoint(
+        checkpoint_path,
+        mutable_state=extract_mutable_state(interrupted_model, interrupted_manifest),
+        optimizer=interrupted_optimizer,
+        scaler=interrupted_scaler,
+        epoch=0,
+        global_step=interrupted_global_step,
+        best_micro_ade=8.0,
+        rng=saved_rng,
+        sampler_state=interrupted_sampler.state_dict(),
+        accumulator=interrupted_accumulator,
+        completed_epoch_record_sha256=None,
+        base_checkpoint_sha256="d" * 64,
+        manifest=interrupted_manifest,
+        config={"checkpoint_interval_steps": 2},
+    )
+    if prefetched_batches is not None:
+        assert len(prefetched_batches[2:]) == 2
+    del interrupted_iterator, committed_iterator, prefetched_batches
+    gc.collect()
+
+    (
+        resumed_model,
+        resumed_manifest,
+        resumed_reference,
+        resumed_optimizer,
+        resumed_scaler,
+        resumed_sampler,
+        resumed_generator,
+        resumed_loader,
+    ) = _new_training_objects(num_workers=num_workers, device=device)
+    resume = load_training_checkpoint(
+        checkpoint_path,
+        model=resumed_model,
+        optimizer=resumed_optimizer,
+        scaler=resumed_scaler,
+        sampler=resumed_sampler,
+        manifest=resumed_manifest,
+        expected_base_checkpoint_sha256="d" * 64,
+    )
+    assert resume.global_step == interrupted_global_step
+    assert resume.epoch == 0
+    assert resume.accumulator == interrupted_accumulator
+    assert resume.sampler.committed_cursor == 4
+    restore_rng_state(resume.rng, resumed_generator)
+    resumed_iterator, resumed_base = create_dataloader_iterator(
+        resumed_loader,
+        resumed_generator,
+        iterator_base_state=resume.rng.dataloader_iterator_base_cpu,
+        current_generator_state=resume.rng.dataloader_cpu,
+    )
+    assert torch.equal(resumed_base, interrupted_base)
+    assert torch.equal(resumed_generator.get_state(), resume.rng.dataloader_cpu)
+    resumed_accumulator, resumed_global_step, remaining_ids = _run_steps(
+        iterator=resumed_iterator,
+        count=2,
+        model=resumed_model,
+        optimizer=resumed_optimizer,
+        scaler=resumed_scaler,
+        reference=resumed_reference,
+        manifest=resumed_manifest,
+        sampler=resumed_sampler,
+        accumulator=resume.accumulator,
+        global_step=resume.global_step,
+        amp=device.type == "cuda",
+    )
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    resumed_rng = capture_rng_state(
+        resumed_generator,
+        dataloader_iterator_base_cpu=resumed_base,
+    )
+
+    assert first_ids + remaining_ids == full_ids
+    assert resumed_global_step == full_global_step == 4
+    if device.type == "cuda":
+        assert resumed_accumulator.epoch == full_accumulator.epoch
+        assert (
+            resumed_accumulator.completed_batches == full_accumulator.completed_batches
+        )
+        assert (
+            resumed_accumulator.completed_samples == full_accumulator.completed_samples
+        )
+        assert resumed_accumulator.grad_norm_count == full_accumulator.grad_norm_count
+        assert resumed_accumulator.total_loss_numerator == pytest.approx(
+            full_accumulator.total_loss_numerator, rel=1.0e-6, abs=1.0e-7
+        )
+        assert resumed_accumulator.trajectory_loss_numerator == pytest.approx(
+            full_accumulator.trajectory_loss_numerator, rel=1.0e-6, abs=1.0e-7
+        )
+        assert resumed_accumulator.preservation_loss_numerator == pytest.approx(
+            full_accumulator.preservation_loss_numerator, rel=1.0e-6, abs=1.0e-7
+        )
+        assert resumed_accumulator.grad_norm_sum == pytest.approx(
+            full_accumulator.grad_norm_sum, rel=1.0e-6, abs=1.0e-7
+        )
+    else:
+        assert resumed_accumulator == full_accumulator
+    assert resumed_sampler.state_dict().committed_cursor == len(_ResumeDataset())
+    assert resumed_sampler.state_dict().epoch == full_sampler.state_dict().epoch == 0
+    assert torch.equal(
+        resumed_sampler.state_dict().permutation,
+        full_sampler.state_dict().permutation,
+    )
+    for name, full_tensor in full_model.state_dict().items():
+        if device.type == "cuda":
+            torch.testing.assert_close(
+                resumed_model.state_dict()[name],
+                full_tensor,
+                rtol=1.0e-6,
+                atol=1.0e-7,
+            )
+        else:
+            assert torch.equal(resumed_model.state_dict()[name], full_tensor), name
+    if device.type == "cuda":
+        _assert_nested_close(
+            resumed_optimizer.state_dict(), full_optimizer.state_dict()
+        )
+    else:
+        _assert_nested_equal(
+            resumed_optimizer.state_dict(), full_optimizer.state_dict()
+        )
+    _assert_nested_equal(resumed_scaler.state_dict(), full_scaler.state_dict())
+    _assert_rng_equal(resumed_rng, full_rng)
+
+
+@pytest.mark.filterwarnings("ignore:Can't initialize NVML")
+def test_prefetched_mid_epoch_checkpoint_resume_is_exact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _assert_mid_epoch_resume_exact(
+        tmp_path,
+        monkeypatch,
+        num_workers=0,
+        device=torch.device("cpu"),
+        explicit_run_ahead=True,
+    )
+
+
+@pytest.mark.skipif(
+    not _worker_prefetch_supported(),
+    reason="sandbox forbids DataLoader multiprocessing resource-sharing sockets",
+)
+def test_two_worker_prefetch_mid_epoch_resume_is_exact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _assert_mid_epoch_resume_exact(
+        tmp_path,
+        monkeypatch,
+        num_workers=2,
+        device=torch.device("cpu"),
+        explicit_run_ahead=False,
+    )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_real_cuda_amp_mid_epoch_resume_is_finite_and_continuous(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _assert_mid_epoch_resume_exact(
+        tmp_path,
+        monkeypatch,
+        num_workers=0,
+        device=torch.device("cuda", 0),
+        explicit_run_ahead=True,
+    )
+
+
+def test_train_one_epoch_retries_overflow_without_advancing_committed_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from morai_ddv2.training import trainer as trainer_module
+
+    torch.manual_seed(801)
+    model = _ResumeModel()
+    manifest = configure_training_boundary(model)
+    reference = snapshot_source_parameters(model, manifest)
+    optimizer = build_optimizer(model, manifest, lr=1.0e-3, weight_decay=0.0)
+    scaler = torch.cuda.amp.GradScaler(enabled=False)
+    dataset = _ResumeDataset(size=4)
+    sampler = StatefulPermutationSampler(dataset, seed=802)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(803)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=2,
+        sampler=sampler,
+        num_workers=0,
+        generator=generator,
+    )
+    expected_batches = []
+    probe_sampler = StatefulPermutationSampler(dataset, seed=802)
+    probe_indices = list(probe_sampler)
+    expected_batches.append(
+        ["sample-{:02d}".format(index) for index in probe_indices[:2]]
+    )
+    expected_batches.append(
+        ["sample-{:02d}".format(index) for index in probe_indices[2:]]
+    )
+    calls = []
+
+    def fake_step(_model, batch, *_args, **_kwargs):
+        calls.append(list(batch["metadata"]["sample_id"]))
+        applied = len(calls) != 1
+        value = float(len(calls))
+        return StepMetrics(value, value + 1.0, value + 2.0, value + 3.0, applied)
+
+    monkeypatch.setattr(trainer_module, "train_step", fake_step)
+    model.eval()
+    accumulator = _zero_accumulator()
+
+    metrics = train_one_epoch(
+        model=model,
+        dataloader=dataloader,
+        sampler=sampler,
+        optimizer=optimizer,
+        scaler=scaler,
+        reference=reference,
+        manifest=manifest,
+        amp=False,
+        grad_clip_norm=1.0,
+        trajectory_weight=12.0,
+        preservation_weight=1.0e-3,
+        epoch=0,
+        global_step=10,
+        accumulator=accumulator,
+    )
+
+    assert calls == [expected_batches[0], expected_batches[0], expected_batches[1]]
+    assert metrics.epoch == 0
+    assert metrics.global_step == 12
+    assert metrics.completed_batches == 2
+    assert metrics.completed_samples == 4
+    assert metrics.mean_total_loss == pytest.approx((2.0 * 2 + 3.0 * 2) / 4)
+    assert metrics.mean_trajectory_loss == pytest.approx((3.0 * 2 + 4.0 * 2) / 4)
+    assert metrics.mean_preservation_loss == pytest.approx((4.0 * 2 + 5.0 * 2) / 4)
+    assert sampler.state_dict().committed_cursor == 4
+    assert sampler.state_dict().epoch == 0
+    assert accumulator == _zero_accumulator()
+    assert not model.training
+    assert model._backbone.image_encoder.training
+
+
+@pytest.mark.filterwarnings("ignore:Can't initialize NVML")
+def test_train_one_epoch_restores_saved_rng_before_rebuilding_resume_iterator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from morai_ddv2.training import trainer as trainer_module
+
+    model = _ResumeModel()
+    manifest = configure_training_boundary(model)
+    reference = snapshot_source_parameters(model, manifest)
+    optimizer = build_optimizer(model, manifest, lr=1.0e-3, weight_decay=0.0)
+    scaler = torch.cuda.amp.GradScaler(enabled=False)
+    dataset = _ResumeDataset(size=4)
+    sampler = StatefulPermutationSampler(dataset, seed=901)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(902)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=2,
+        sampler=sampler,
+        num_workers=0,
+        generator=generator,
+    )
+    original_iterator, iterator_base = create_dataloader_iterator(dataloader, generator)
+    saved_rng = capture_rng_state(
+        generator,
+        dataloader_iterator_base_cpu=iterator_base,
+    )
+    saved_current = saved_rng.dataloader_cpu.clone()
+    expected_draws = [
+        (random.random(), float(np.random.random_sample()), float(torch.rand(())))
+        for _ in range(2)
+    ]
+    del original_iterator
+    random.seed(911)
+    np.random.seed(912)
+    torch.manual_seed(913)
+    generator.manual_seed(914)
+    observed_draws = []
+
+    def fake_step(_model, _batch, *_args, **_kwargs):
+        observed_draws.append(
+            (random.random(), float(np.random.random_sample()), float(torch.rand(())))
+        )
+        return StepMetrics(1.0, 2.0, 3.0, 4.0, True)
+
+    monkeypatch.setattr(trainer_module, "train_step", fake_step)
+
+    metrics = train_one_epoch(
+        model=model,
+        dataloader=dataloader,
+        sampler=sampler,
+        optimizer=optimizer,
+        scaler=scaler,
+        reference=reference,
+        manifest=manifest,
+        amp=False,
+        grad_clip_norm=1.0,
+        trajectory_weight=12.0,
+        preservation_weight=1.0e-3,
+        epoch=0,
+        global_step=0,
+        accumulator=_zero_accumulator(),
+        resume_rng=saved_rng,
+    )
+
+    assert observed_draws == expected_draws
+    assert torch.equal(generator.get_state(), saved_current)
+    assert metrics.global_step == 2
+    assert sampler.state_dict().committed_cursor == 4
+
+
+@pytest.mark.filterwarnings("ignore:Can't initialize NVML")
+def test_train_one_epoch_atomically_checkpoints_only_committed_intervals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from morai_ddv2.training import trainer as trainer_module
+
+    model = _ResumeModel()
+    manifest = configure_training_boundary(model)
+    reference = snapshot_source_parameters(model, manifest)
+    optimizer = build_optimizer(model, manifest, lr=1.0e-3, weight_decay=0.0)
+    scaler = torch.cuda.amp.GradScaler(enabled=False)
+    dataset = _ResumeDataset(size=6)
+    sampler = StatefulPermutationSampler(dataset, seed=921)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(922)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=2,
+        sampler=sampler,
+        num_workers=0,
+        generator=generator,
+    )
+    expected_iterator_base = generator.get_state().clone()
+    calls = []
+
+    def fake_step(_model, _batch, *_args, **_kwargs):
+        value = float(len(calls) + 1)
+        calls.append(value)
+        return StepMetrics(value, value + 1.0, value + 2.0, value + 3.0, True)
+
+    monkeypatch.setattr(trainer_module, "train_step", fake_step)
+    checkpoint_path = tmp_path / "last.pt"
+
+    metrics = train_one_epoch(
+        model=model,
+        dataloader=dataloader,
+        sampler=sampler,
+        optimizer=optimizer,
+        scaler=scaler,
+        reference=reference,
+        manifest=manifest,
+        amp=False,
+        grad_clip_norm=1.0,
+        trajectory_weight=12.0,
+        preservation_weight=1.0e-3,
+        epoch=0,
+        global_step=0,
+        accumulator=_zero_accumulator(),
+        checkpoint_path=checkpoint_path,
+        checkpoint_interval_steps=2,
+        best_micro_ade=9.0,
+        completed_epoch_record_sha256=None,
+        base_checkpoint_sha256="e" * 64,
+        config={"checkpoint_interval_steps": 2},
+    )
+
+    payload = torch.load(checkpoint_path, map_location="cpu")
+    assert payload["global_step"] == 2
+    assert payload["sampler_state"].committed_cursor == 4
+    assert payload["accumulator"].completed_batches == 2
+    assert payload["accumulator"].completed_samples == 4
+    assert payload["accumulator"].total_loss_numerator == 6.0
+    assert payload["accumulator"].trajectory_loss_numerator == 10.0
+    assert payload["accumulator"].preservation_loss_numerator == 14.0
+    assert payload["accumulator"].grad_norm_sum == 9.0
+    assert payload["accumulator"].grad_norm_count == 2
+    assert torch.equal(
+        payload["rng"].dataloader_iterator_base_cpu,
+        expected_iterator_base,
+    )
+    assert torch.equal(
+        payload["rng"].dataloader_cpu,
+        generator.get_state(),
+    )
+    assert not checkpoint_path.with_name("last.pt.partial").exists()
+    assert metrics.global_step == 3
+    assert sampler.state_dict().committed_cursor == 6
+    assert sampler.state_dict().epoch == 0
