@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Mapping
 
 import torch
@@ -17,6 +18,23 @@ class SharedTrajectoryContext:
     status_encoding: torch.Tensor
     status_feature: torch.Tensor
     camera_feature: torch.Tensor
+
+
+@dataclass(frozen=True)
+class NoisyAnchorBatch:
+    plan_anchor: torch.Tensor
+    decoder_input: torch.Tensor
+    timesteps: torch.Tensor
+    noise: torch.Tensor
+
+
+@dataclass(frozen=True)
+class SupervisedTrajectoryResult:
+    trajectory_loss: torch.Tensor
+    poses_reg: torch.Tensor
+    poses_cls: torch.Tensor
+    plan_anchor: torch.Tensor
+    timesteps: torch.Tensor
 
 
 def _validated_features(
@@ -90,4 +108,118 @@ def build_shared_trajectory_context(
         status_encoding,
         status,
         camera,
+    )
+
+
+def sample_noisy_plan_anchors(
+    head: nn.Module, batch_size: int, device: torch.device
+) -> NoisyAnchorBatch:
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    anchor = head.plan_anchor.to(device=device, dtype=torch.float32)
+    if anchor.shape != (20, 8, 2):
+        raise ValueError("plan_anchor must have shape [20,8,2]")
+    anchor = anchor.unsqueeze(0).repeat(batch_size, 1, 1, 1)
+    normalized = anchor.clone()
+    normalized[..., 0] /= 50.0
+    normalized[..., 1] /= 20.0
+    timesteps = torch.randint(0, 50, (batch_size,), device=device, dtype=torch.long)
+    noise = torch.randn_like(normalized)
+    noisy = head.diffusion_scheduler.add_noise(
+        original_samples=normalized,
+        noise=noise,
+        timesteps=timesteps,
+    ).float()
+    decoder_input = noisy.clamp(-1.0, 1.0)
+    decoder_input[..., 0] *= 50.0
+    decoder_input[..., 1] *= 20.0
+    return NoisyAnchorBatch(anchor, decoder_input, timesteps, noise)
+
+
+def _sine_xy_embedding(points: torch.Tensor) -> torch.Tensor:
+    half_hidden_dim = 32
+    dim_t = torch.arange(half_hidden_dim, dtype=torch.float32, device=points.device)
+    dim_t = 10000 ** (2 * (dim_t // 2) / half_hidden_dim)
+    x_embed = points[..., 0] * (2 * math.pi)
+    y_embed = points[..., 1] * (2 * math.pi)
+    pos_x = x_embed[..., None] / dim_t
+    pos_y = y_embed[..., None] / dim_t
+    pos_x = torch.stack(
+        (pos_x[..., 0::2].sin(), pos_x[..., 1::2].cos()), dim=-1
+    ).flatten(-2)
+    pos_y = torch.stack(
+        (pos_y[..., 0::2].sin(), pos_y[..., 1::2].cos()), dim=-1
+    ).flatten(-2)
+    return torch.cat((pos_y, pos_x), dim=-1)
+
+
+def forward_trajectory_supervised(
+    model: nn.Module,
+    features: Mapping[str, torch.Tensor],
+    target_trajectory: torch.Tensor,
+) -> SupervisedTrajectoryResult:
+    if not isinstance(target_trajectory, torch.Tensor):
+        raise TypeError("target_trajectory must be a torch.Tensor")
+    if target_trajectory.ndim != 3 or target_trajectory.shape[1:] != (8, 3):
+        raise ValueError("target_trajectory must have shape [B,8,3]")
+    if target_trajectory.dtype != torch.float32:
+        raise ValueError("target_trajectory must use torch.float32")
+    if not torch.isfinite(target_trajectory).all().item():
+        raise ValueError("target_trajectory must contain only finite values")
+
+    head = model._trajectory_head
+    if len(head.diff_decoder.layers) != 1:
+        raise RuntimeError("DDV2 supervised adapter requires exactly one decoder layer")
+    loss_computer = head.loss_computer
+    if loss_computer.cls_loss_weight != 10.0 or loss_computer.reg_loss_weight != 8.0:
+        raise RuntimeError("DDV2 upstream loss weights must be cls=10.0 and reg=8.0")
+
+    context = build_shared_trajectory_context(model, features)
+    batch_size = context.trajectory_query.shape[0]
+    if target_trajectory.shape[0] != batch_size:
+        raise ValueError("target_trajectory batch must match features")
+    if target_trajectory.device != context.trajectory_query.device:
+        raise ValueError("target_trajectory must share the feature device")
+
+    noisy = sample_noisy_plan_anchors(head, batch_size, context.trajectory_query.device)
+    trajectory_embedding = _sine_xy_embedding(noisy.decoder_input).flatten(-2)
+    trajectory_feature = head.plan_anchor_encoder(trajectory_embedding)
+    trajectory_feature = trajectory_feature.view(batch_size, 20, -1)
+    time_embedding = head.time_mlp(noisy.timesteps).view(batch_size, 1, -1)
+    poses_reg_list, poses_cls_list, _ = head.diff_decoder(
+        trajectory_feature,
+        noisy.decoder_input,
+        context.cross_bev_feature,
+        context.bev_spatial_shape,
+        context.agents_query,
+        context.trajectory_query,
+        time_embedding,
+        context.status_encoding[:, None],
+        None,
+    )
+    if len(poses_reg_list) != 1 or len(poses_cls_list) != 1:
+        raise RuntimeError("DDV2 decoder must return exactly one output group")
+    poses_reg = poses_reg_list[0]
+    poses_cls_source = poses_cls_list[0]
+    if poses_reg.shape != (batch_size, 20, 8, 3):
+        raise RuntimeError("DDV2 regression source must have shape [B,20,8,3]")
+    if poses_cls_source.shape != (batch_size, 1, 20):
+        raise RuntimeError("DDV2 classification source must have shape [B,1,20]")
+    poses_cls = poses_cls_source.squeeze(1)
+    trajectory_loss = loss_computer(
+        poses_reg,
+        poses_cls,
+        {"trajectory": target_trajectory},
+        noisy.plan_anchor,
+    )
+    if not isinstance(trajectory_loss, torch.Tensor) or trajectory_loss.ndim != 0:
+        raise RuntimeError("DDV2 trajectory loss must be a scalar tensor")
+    if not torch.isfinite(trajectory_loss).item():
+        raise RuntimeError("DDV2 trajectory loss must be finite")
+    return SupervisedTrajectoryResult(
+        trajectory_loss,
+        poses_reg,
+        poses_cls,
+        noisy.plan_anchor,
+        noisy.timesteps,
     )
