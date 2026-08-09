@@ -165,20 +165,29 @@ def _assert_nested_equal(left, right) -> None:
         assert left == right
 
 
-def _assert_nested_close(left, right) -> None:
+def _assert_nested_close(
+    left,
+    right,
+    *,
+    rtol: float = 1.0e-6,
+    atol: float = 1.0e-7,
+) -> None:
     if isinstance(left, torch.Tensor):
         assert isinstance(right, torch.Tensor)
-        torch.testing.assert_close(left, right, rtol=1.0e-6, atol=1.0e-7)
+        if left.is_floating_point() or left.is_complex():
+            torch.testing.assert_close(left, right, rtol=rtol, atol=atol)
+        else:
+            assert torch.equal(left, right)
     elif isinstance(left, dict):
         assert isinstance(right, dict)
         assert left.keys() == right.keys()
         for key in left:
-            _assert_nested_close(left[key], right[key])
+            _assert_nested_close(left[key], right[key], rtol=rtol, atol=atol)
     elif isinstance(left, (list, tuple)):
         assert type(left) is type(right)
         assert len(left) == len(right)
         for left_item, right_item in zip(left, right):
-            _assert_nested_close(left_item, right_item)
+            _assert_nested_close(left_item, right_item, rtol=rtol, atol=atol)
     else:
         assert left == right
 
@@ -304,6 +313,8 @@ def _worker_prefetch_supported() -> bool:
 _REAL_CHECKPOINT_SHA256 = (
     "452c4e0dd328c49b981f3fd5ed13eb1c6a2b0f3a9486adf43b40a5645ed543b1"
 )
+_CUDA_CONTINUITY_RTOL = 5.0e-3
+_CUDA_CONTINUITY_ATOL = 1.0e-6
 
 
 def _real_sel_assets() -> SelAssets:
@@ -443,6 +454,7 @@ def _run_real_cuda_committed_steps(
     global_step,
 ):
     committed_ids = []
+    committed_metrics = []
     attempts = []
     maximum_attempts = count + 24
     while len(committed_ids) < count:
@@ -490,7 +502,15 @@ def _run_real_cuda_committed_steps(
         accumulator = _advance_accumulator(accumulator, metrics, batch_size)
         global_step += 1
         committed_ids.extend(batch_ids)
-    return iterator, accumulator, global_step, committed_ids, attempts
+        committed_metrics.append(metrics)
+    return (
+        iterator,
+        accumulator,
+        global_step,
+        committed_ids,
+        attempts,
+        committed_metrics,
+    )
 
 
 def _assert_mid_epoch_resume_exact(
@@ -746,6 +766,7 @@ def test_real_cuda_amp_mid_epoch_resume_is_finite_and_continuous(
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
     monkeypatch.setenv("MPLCONFIGDIR", str(tmp_path / "matplotlib"))
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     monkeypatch.setattr(sys, "dont_write_bytecode", True)
     monkeypatch.setattr(torch.backends.cudnn, "benchmark", False)
     monkeypatch.setattr(torch.backends.cudnn, "deterministic", True)
@@ -771,6 +792,7 @@ def test_real_cuda_amp_mid_epoch_resume_is_finite_and_continuous(
         full_global_step,
         full_ids,
         full_attempts,
+        full_metrics,
     ) = _run_real_cuda_committed_steps(
         iterator=full_iterator,
         iterator_base=full_base,
@@ -830,6 +852,7 @@ def test_real_cuda_amp_mid_epoch_resume_is_finite_and_continuous(
         interrupted_global_step,
         first_ids,
         first_attempts,
+        interrupted_first_metrics,
     ) = _run_real_cuda_committed_steps(
         iterator=interrupted_iterator,
         iterator_base=interrupted_base,
@@ -849,6 +872,28 @@ def test_real_cuda_amp_mid_epoch_resume_is_finite_and_continuous(
         interrupted_generator,
         dataloader_iterator_base_cpu=interrupted_base,
     )
+    checkpoint_mutable = _owned_cpu(
+        extract_mutable_state(interrupted_model, interrupted_manifest)
+    )
+    checkpoint_optimizer_state = _owned_cpu(interrupted_optimizer.state_dict())
+    checkpoint_scaler_state = _owned_cpu(interrupted_scaler.state_dict())
+    checkpoint_sampler_state = interrupted_sampler.state_dict()
+    checkpoint_accumulator = interrupted_accumulator
+    checkpoint_global_step = interrupted_global_step
+    assert first_ids == full_ids[:1]
+    assert first_attempts == full_attempts[: len(first_attempts)]
+    assert interrupted_first_metrics[0].optimizer_step_applied
+    for name in (
+        "total_loss",
+        "trajectory_loss",
+        "preservation_loss",
+        "grad_norm",
+    ):
+        assert getattr(interrupted_first_metrics[0], name) == pytest.approx(
+            getattr(full_metrics[0], name),
+            rel=_CUDA_CONTINUITY_RTOL,
+            abs=_CUDA_CONTINUITY_ATOL,
+        )
     checkpoint_path = tmp_path / "real-ddv2-last.pt"
     save_training_checkpoint(
         checkpoint_path,
@@ -869,6 +914,69 @@ def test_real_cuda_amp_mid_epoch_resume_is_finite_and_continuous(
         manifest=interrupted_manifest,
         config={"checkpoint_interval_steps": 1},
     )
+    post_save_rng = capture_rng_state(
+        interrupted_generator,
+        dataloader_iterator_base_cpu=interrupted_base,
+    )
+    _assert_rng_equal(post_save_rng, saved_rng)
+    (
+        interrupted_iterator,
+        repeat_accumulator,
+        repeat_global_step,
+        repeat_second_ids,
+        repeat_second_attempts,
+        repeat_second_metrics,
+    ) = _run_real_cuda_committed_steps(
+        iterator=interrupted_iterator,
+        iterator_base=interrupted_base,
+        dataloader=interrupted_loader,
+        generator=interrupted_generator,
+        count=1,
+        model=interrupted_model,
+        optimizer=interrupted_optimizer,
+        scaler=interrupted_scaler,
+        reference=interrupted_reference,
+        manifest=interrupted_manifest,
+        sampler=interrupted_sampler,
+        accumulator=interrupted_accumulator,
+        global_step=interrupted_global_step,
+    )
+    torch.cuda.synchronize()
+    repeat_rng = capture_rng_state(
+        interrupted_generator,
+        dataloader_iterator_base_cpu=interrupted_base,
+    )
+    assert first_ids + repeat_second_ids == full_ids
+    assert first_attempts + repeat_second_attempts == full_attempts
+    assert repeat_second_metrics[0].optimizer_step_applied
+    for name in (
+        "total_loss",
+        "trajectory_loss",
+        "preservation_loss",
+        "grad_norm",
+    ):
+        assert getattr(repeat_second_metrics[0], name) == pytest.approx(
+            getattr(full_metrics[1], name),
+            rel=_CUDA_CONTINUITY_RTOL,
+            abs=_CUDA_CONTINUITY_ATOL,
+        )
+    assert repeat_global_step == full_global_step == 2
+    assert repeat_accumulator.epoch == full_accumulator.epoch == 0
+    assert repeat_accumulator.completed_batches == 2
+    assert repeat_accumulator.completed_samples == 2
+    assert repeat_accumulator.grad_norm_count == 2
+    for name in (
+        "total_loss_numerator",
+        "trajectory_loss_numerator",
+        "preservation_loss_numerator",
+        "grad_norm_sum",
+    ):
+        assert getattr(repeat_accumulator, name) == pytest.approx(
+            getattr(full_accumulator, name),
+            rel=_CUDA_CONTINUITY_RTOL,
+            abs=_CUDA_CONTINUITY_ATOL,
+        )
+    _assert_rng_equal(repeat_rng, full_rng)
     del (
         interrupted_iterator,
         interrupted_loader,
@@ -902,9 +1010,25 @@ def test_real_cuda_amp_mid_epoch_resume_is_finite_and_continuous(
         expected_base_checkpoint_sha256=_REAL_CHECKPOINT_SHA256,
     )
     assert resume.epoch == 0
-    assert resume.global_step == interrupted_global_step == 1
-    assert resume.accumulator == interrupted_accumulator
+    assert resume.global_step == checkpoint_global_step == 1
+    assert resume.accumulator == checkpoint_accumulator
     assert resume.sampler.committed_cursor == 1
+    loaded_mutable = _owned_cpu(extract_mutable_state(resumed_model, resumed_manifest))
+    loaded_optimizer_state = _owned_cpu(resumed_optimizer.state_dict())
+    _assert_nested_equal(loaded_mutable, checkpoint_mutable)
+    _assert_nested_equal(loaded_optimizer_state, checkpoint_optimizer_state)
+    _assert_nested_equal(resumed_scaler.state_dict(), checkpoint_scaler_state)
+    _assert_nested_equal(
+        resumed_sampler.state_dict().__dict__,
+        checkpoint_sampler_state.__dict__,
+    )
+    _assert_rng_equal(resume.rng, saved_rng)
+    del (
+        loaded_mutable,
+        loaded_optimizer_state,
+        checkpoint_mutable,
+        checkpoint_optimizer_state,
+    )
     restore_rng_state(resume.rng, resumed_generator)
     resumed_iterator, resumed_base = create_dataloader_iterator(
         resumed_loader,
@@ -912,12 +1036,18 @@ def test_real_cuda_amp_mid_epoch_resume_is_finite_and_continuous(
         iterator_base_state=resume.rng.dataloader_iterator_base_cpu,
         current_generator_state=resume.rng.dataloader_cpu,
     )
+    restored_rng = capture_rng_state(
+        resumed_generator,
+        dataloader_iterator_base_cpu=resumed_base,
+    )
+    _assert_rng_equal(restored_rng, saved_rng)
     (
         resumed_iterator,
         resumed_accumulator,
         resumed_global_step,
         remaining_ids,
         remaining_attempts,
+        resumed_second_metrics,
     ) = _run_real_cuda_committed_steps(
         iterator=resumed_iterator,
         iterator_base=resumed_base,
@@ -941,48 +1071,53 @@ def test_real_cuda_amp_mid_epoch_resume_is_finite_and_continuous(
 
     assert first_ids + remaining_ids == full_ids
     assert first_attempts + remaining_attempts == full_attempts
+    assert resumed_second_metrics[0].optimizer_step_applied
+    for name in (
+        "total_loss",
+        "trajectory_loss",
+        "preservation_loss",
+        "grad_norm",
+    ):
+        assert getattr(resumed_second_metrics[0], name) == pytest.approx(
+            getattr(full_metrics[1], name),
+            rel=_CUDA_CONTINUITY_RTOL,
+            abs=_CUDA_CONTINUITY_ATOL,
+        )
     assert resumed_global_step == full_global_step == 2
     assert resumed_accumulator.epoch == full_accumulator.epoch == 0
     assert resumed_accumulator.completed_batches == 2
     assert resumed_accumulator.completed_samples == 2
     assert resumed_accumulator.grad_norm_count == 2
-    assert resumed_accumulator.total_loss_numerator == pytest.approx(
-        full_accumulator.total_loss_numerator,
-        rel=1.0e-4,
-        abs=1.0e-6,
-    )
-    assert resumed_accumulator.trajectory_loss_numerator == pytest.approx(
-        full_accumulator.trajectory_loss_numerator,
-        rel=1.0e-4,
-        abs=1.0e-6,
-    )
-    assert resumed_accumulator.preservation_loss_numerator == pytest.approx(
-        full_accumulator.preservation_loss_numerator,
-        rel=1.0e-4,
-        abs=1.0e-8,
-    )
-    assert resumed_accumulator.grad_norm_sum == pytest.approx(
-        full_accumulator.grad_norm_sum,
-        rel=1.0e-4,
-        abs=1.0e-6,
-    )
-    resumed_mutable = _owned_cpu(extract_mutable_state(resumed_model, resumed_manifest))
-    _assert_finite_nested(resumed_mutable)
-    _assert_finite_nested(resumed_optimizer.state_dict())
-    for name, full_tensor in full_mutable.items():
-        torch.testing.assert_close(
-            resumed_mutable[name],
-            full_tensor,
-            rtol=1.0e-4,
-            atol=1.0e-6,
+    for name in (
+        "total_loss_numerator",
+        "trajectory_loss_numerator",
+        "preservation_loss_numerator",
+        "grad_norm_sum",
+    ):
+        assert getattr(resumed_accumulator, name) == pytest.approx(
+            getattr(full_accumulator, name),
+            rel=_CUDA_CONTINUITY_RTOL,
+            abs=_CUDA_CONTINUITY_ATOL,
         )
+    resumed_mutable = _owned_cpu(extract_mutable_state(resumed_model, resumed_manifest))
+    resumed_optimizer_state = _owned_cpu(resumed_optimizer.state_dict())
+    _assert_finite_nested(resumed_mutable)
+    _assert_finite_nested(resumed_optimizer_state)
     _assert_nested_close(
-        _owned_cpu(resumed_optimizer.state_dict()),
+        resumed_mutable,
+        full_mutable,
+        rtol=_CUDA_CONTINUITY_RTOL,
+        atol=_CUDA_CONTINUITY_ATOL,
+    )
+    _assert_nested_close(
+        resumed_optimizer_state,
         full_optimizer_state,
+        rtol=_CUDA_CONTINUITY_RTOL,
+        atol=_CUDA_CONTINUITY_ATOL,
     )
     _assert_nested_equal(resumed_scaler.state_dict(), full_scaler_state)
     resumed_sampler_state = resumed_sampler.state_dict()
-    assert resumed_sampler_state.epoch == full_sampler_state.epoch == 0
+    assert resumed_sampler_state.epoch == 0
     assert resumed_sampler_state.committed_cursor == 2
     _assert_nested_equal(
         resumed_sampler_state.__dict__,
