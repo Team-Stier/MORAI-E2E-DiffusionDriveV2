@@ -6,7 +6,7 @@
 
 **Architecture:** The official SEL checkpoint remains the authoritative deployment container. A PDM-free 971-key derivative is strict-loaded for learning, and a parameter/buffer-free supervised adapter reuses its shared feature graph plus its single trajectory decoder layer. Training updates one exact allowlist and its BatchNorm state with trajectory-only loss; export merges only that mutable state back into the untouched raw 972-key container, publishes external metadata, and verifies the bundle before runtime integration.
 
-**Tech Stack:** Python 3.9.25, PyTorch 2.0.1+cu118, torchvision 0.15.2+cu118, diffusers 0.35.2, official DiffusionDriveV2 SEL source/checkpoint, Validator model environment, NumPy, h5py 3.10.0, rfc8785 0.1.4, pytest, Ruff, mypy
+**Tech Stack:** Python 3.9.25, PyTorch 2.0.1+cu118, torchvision 0.15.2+cu118, diffusers 0.35.2, official DiffusionDriveV2 SEL source/checkpoint, Validator model environment, NumPy, h5py 3.10.0, rfc8785 0.1.4, pytest, Ruff, mypy, mypy-extensions 1.1.0
 
 ## Global Constraints
 
@@ -67,20 +67,21 @@ tests/
 **Interfaces:**
 
 - `.venv-train/bin/python` is CPython 3.9.25.
-- Torch is `2.0.1+cu118`, torchvision `0.15.2+cu118`, diffusers `0.35.2`, NumPy `1.23.4`, SciPy `1.13.1`, timm `1.0.28`, OpenCV `4.9.0.80`, PyYAML `6.0.3`, and pytest `8.4.2`, matching the pinned Validator lock. The project-owned additions are exactly h5py `3.10.0`, rfc8785 `0.1.4`, Ruff `0.12.7`, and mypy `1.14.1`.
+- Torch is `2.0.1+cu118`, torchvision `0.15.2+cu118`, diffusers `0.35.2`, NumPy `1.23.4`, SciPy `1.13.1`, timm `1.0.28`, OpenCV `4.9.0.80`, PyYAML `6.0.3`, and pytest `8.4.2`, matching the pinned Validator lock. The project-owned additions are exactly h5py `3.10.0`, rfc8785 `0.1.4`, Ruff `0.12.7`, and mypy `1.14.1`; the sync input also pins mypy's mandatory `mypy_extensions` closure at `1.1.0`.
 - `scripts/fetch_ddv2_assets.sh` uses Validator's official profile/fetcher and verifies, rather than fabricates, the SEL checkpoint, ResNet-34 backbone, trajectory anchors, generated PDM-free derivative, and source checkout.
 
-- [ ] Write `requirements/training.txt` as the one executable sync input with these exact bytes. It includes the immutable Validator lock and pins only the four project-owned packages missing from that lock:
+- [ ] Write `requirements/training.txt` as the one executable sync input with these exact bytes. It includes the immutable Validator lock, the four project-owned packages missing from that lock, and mypy's mandatory closure dependency:
 
 ```text
 -r ../third_party/E2E-OpenLoop-ROS-Validator/src/Validator_pkg/validator_inference/requirements/diffusiondrive_v2.lock
 h5py==3.10.0
 mypy==1.14.1
+mypy_extensions==1.1.0
 rfc8785==0.1.4
 ruff==0.12.7
 ```
 
-- [ ] Implement `scripts/bootstrap_train_env.sh` with `/home/stier/.local/bin/uv python install 3.9.25`, `/home/stier/.local/bin/uv venv --python 3.9.25 .venv-train`, and `/home/stier/.local/bin/uv pip sync --python .venv-train/bin/python requirements/training.txt`; then install this project editable with `/home/stier/.local/bin/uv pip install --python .venv-train/bin/python --no-deps -e .`. Never sync the Validator lock separately, because that would omit or remove the four project-owned packages.
+- [ ] Implement `scripts/bootstrap_train_env.sh` with `/home/stier/.local/bin/uv python install 3.9.25`, `/home/stier/.local/bin/uv venv --python 3.9.25 .venv-train`, and `/home/stier/.local/bin/uv pip sync --python .venv-train/bin/python requirements/training.txt`; then install this project editable with `/home/stier/.local/bin/uv pip install --python .venv-train/bin/python --no-deps -e .`. Never sync the Validator lock separately, because that would omit or remove the four project-owned packages and mypy's mandatory closure dependency.
 - [ ] Run `bash scripts/bootstrap_train_env.sh`, then confirm `.venv-train/bin/python -c 'import sys; assert sys.version_info[:3] == (3, 9, 25)'` exits 0. This environment-only bootstrap is required before pytest can collect the red repository/asset contract.
 - [ ] Write a subprocess-based environment test that asserts interpreter/package versions, exact submodule commits, presence of the generated derivative, and base asset hashes from the baseline Validator profile. Mark the CUDA communication assertion `gpu` so CPU implementation work can run while the host driver is repaired.
 

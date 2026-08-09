@@ -13,7 +13,8 @@ env -u PYTHONPATH bash scripts/fetch_ddv2_assets.sh
 ```
 
 The bootstrap synchronizes the pinned Validator DiffusionDriveV2 lock plus
-the project's h5py, rfc8785, Ruff, and mypy versions into `.venv-train`.
+the project's h5py, rfc8785, Ruff, and mypy versions and mypy's mandatory
+mypy-extensions closure pin into `.venv-train`.
 The asset command uses the pinned Validator profile and fetcher to verify the
 official SEL checkpoint, ResNet-34 backbone, trajectory anchors, source
 checkout, and generated PDM-free derivative. Verified assets and the emitted

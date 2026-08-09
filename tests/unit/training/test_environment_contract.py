@@ -29,6 +29,7 @@ TRAINING_REQUIREMENTS_BYTES = (
     b"validator_inference/requirements/diffusiondrive_v2.lock\n"
     b"h5py==3.10.0\n"
     b"mypy==1.14.1\n"
+    b"mypy_extensions==1.1.0\n"
     b"rfc8785==0.1.4\n"
     b"ruff==0.12.7\n"
 )
@@ -65,6 +66,7 @@ def test_training_runtime_versions() -> None:
     import cv2
     import diffusers
     import h5py
+    import mypy_extensions
     import numpy
     import scipy
     import timm
@@ -97,12 +99,14 @@ def test_training_runtime_versions() -> None:
         "rfc8785": "0.1.4",
         "ruff": "0.12.7",
         "mypy": "1.14.1",
+        "mypy-extensions": "1.1.0",
     }
     observed = {
         distribution: importlib.metadata.version(distribution)
         for distribution in expected
     }
     assert observed == expected
+    assert mypy_extensions.__name__ == "mypy_extensions"
 
 
 def test_training_sync_input_and_bootstrap_contract(repo_root: Path) -> None:
