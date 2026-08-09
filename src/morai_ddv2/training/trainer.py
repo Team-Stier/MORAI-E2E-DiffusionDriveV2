@@ -333,6 +333,10 @@ def train_one_epoch(
     if reapplied != manifest:
         raise TrainingBoundaryError("freeze manifest changed at epoch boundary")
     current = _validated_accumulator(accumulator, sampler, epoch)
+    if current.completed_samples > 0 and resume_rng is None:
+        raise ResumeContractError(
+            "resume RNG is required for committed mid-epoch progress"
+        )
     generator = dataloader.generator
     if not isinstance(generator, torch.Generator) or generator.device.type != "cpu":
         raise ResumeContractError("training DataLoader must own a CPU generator")

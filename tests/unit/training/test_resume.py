@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+import copy
 from dataclasses import replace
 import gc
+import math
+import os
 from pathlib import Path
 import random
 import socket
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -33,8 +37,12 @@ from morai_ddv2.training.rng import (
     create_dataloader_iterator,
     restore_rng_state,
 )
-from morai_ddv2.training.sampler import StatefulPermutationSampler
+from morai_ddv2.training.sampler import ResumeContractError, StatefulPermutationSampler
 from morai_ddv2.training.trainer import train_one_epoch, train_step
+from morai_ddv2.upstream.ddv2_sel import (
+    SelAssets,
+    load_pdm_free_sel_network,
+)
 
 
 class _ResumeDataset(Dataset):
@@ -54,6 +62,36 @@ class _ResumeDataset(Dataset):
                 [value * 0.25, -value * 0.5], dtype=torch.float32
             ),
             "metadata": {"sample_id": "sample-{:02d}".format(index)},
+        }
+
+
+class _RealCudaDataset(Dataset):
+    def __len__(self) -> int:
+        return 2
+
+    def __getitem__(self, index: int):
+        scale = float(index + 1)
+        x = torch.arange(1, 9, dtype=torch.float32) * (0.1 * scale)
+        zeros = torch.zeros_like(x)
+        return {
+            "features": {
+                "camera_feature": torch.full(
+                    (3, 256, 1024),
+                    0.01 * scale,
+                    dtype=torch.float32,
+                ),
+                "lidar_feature": torch.full(
+                    (1, 256, 256),
+                    0.005 * scale,
+                    dtype=torch.float32,
+                ),
+                "status_feature": torch.tensor(
+                    [scale, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+                    dtype=torch.float32,
+                ),
+            },
+            "trajectory": torch.stack((x, zeros, zeros), dim=-1),
+            "metadata": {"sample_id": "real-{:02d}".format(index)},
         }
 
 
@@ -261,6 +299,198 @@ def _worker_prefetch_supported() -> bool:
         if probe is not None:
             probe.close()
     return True
+
+
+_REAL_CHECKPOINT_SHA256 = (
+    "452c4e0dd328c49b981f3fd5ed13eb1c6a2b0f3a9486adf43b40a5645ed543b1"
+)
+
+
+def _real_sel_assets() -> SelAssets:
+    repository_root = Path(__file__).resolve().parents[3]
+    validator_value = os.environ.get("MORAI_DDV2_VALIDATOR_ROOT")
+    validator_root = (
+        Path(validator_value).resolve()
+        if validator_value
+        else (repository_root / "third_party/E2E-OpenLoop-ROS-Validator").resolve()
+    )
+    checkpoint_value = os.environ.get("MORAI_DDV2_SEL_CHECKPOINT")
+    checkpoint = (
+        Path(checkpoint_value).resolve()
+        if checkpoint_value
+        else validator_root
+        / "models/diffusiondrive_v2/navsim_v2/diffusiondrivev2_sel.ckpt"
+    )
+    assets = SelAssets(
+        v2_checkout=validator_root / "models/sources/diffusiondrive_v2",
+        validator_root=validator_root,
+        checkpoint=checkpoint,
+        image_backbone=(
+            validator_root / "models/shared/timm/resnet34.a1_in1k/pytorch_model.bin"
+        ),
+        trajectory_anchor=(
+            validator_root
+            / "models/diffusiondrive_v2/navsim_v2/kmeans_navsim_traj_20.npy"
+        ),
+    )
+    required = (
+        assets.v2_checkout / "navsim/agents/diffusiondrivev2/"
+        "diffusiondrivev2_model_sel_inference.py",
+        assets.checkpoint,
+        assets.image_backbone,
+        assets.trajectory_anchor,
+    )
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        pytest.skip("pinned DDV2 CUDA assets are unavailable: {}".format(missing))
+    return assets
+
+
+def _new_real_cuda_training_objects(assets: SelAssets):
+    device = torch.device("cuda", 0)
+    model, raw = load_pdm_free_sel_network(assets, device)
+    assert raw.checkpoint_sha256 == _REAL_CHECKPOINT_SHA256
+    del raw
+    assert len(model.state_dict()) == 971
+    assert model.__class__.__module__ == (
+        "navsim.agents.diffusiondrivev2.diffusiondrivev2_model_sel_inference"
+    )
+    manifest = configure_training_boundary(model)
+    assert len(manifest.trainable_parameters) == 372
+    assert len(manifest.mutable_state_entries) == 588
+    reference = snapshot_source_parameters(model, manifest)
+    optimizer = build_optimizer(model, manifest, lr=1.0e-5, weight_decay=1.0e-4)
+    scaler = torch.cuda.amp.GradScaler(init_scale=1.0, enabled=True)
+    dataset = _RealCudaDataset()
+    sampler = StatefulPermutationSampler(dataset, seed=1201)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(1202)
+    loader = DataLoader(
+        dataset,
+        batch_size=1,
+        sampler=sampler,
+        num_workers=0,
+        generator=generator,
+    )
+    return (
+        model,
+        manifest,
+        reference,
+        optimizer,
+        scaler,
+        sampler,
+        generator,
+        loader,
+    )
+
+
+def _seed_real_cuda_run() -> None:
+    random.seed(1203)
+    np.random.seed(1204)
+    torch.manual_seed(1205)
+    torch.cuda.manual_seed_all(1205)
+
+
+def _to_device(value, device: torch.device):
+    if isinstance(value, torch.Tensor):
+        return value.to(device=device)
+    if isinstance(value, dict):
+        return {key: _to_device(item, device) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_to_device(item, device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_to_device(item, device) for item in value)
+    return value
+
+
+def _owned_cpu(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().to(device="cpu").clone()
+    if isinstance(value, dict):
+        return {key: _owned_cpu(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_owned_cpu(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_owned_cpu(item) for item in value)
+    return copy.deepcopy(value)
+
+
+def _assert_finite_nested(value) -> None:
+    if isinstance(value, torch.Tensor):
+        assert torch.isfinite(value).all()
+    elif isinstance(value, dict):
+        for item in value.values():
+            _assert_finite_nested(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _assert_finite_nested(item)
+
+
+def _run_real_cuda_committed_steps(
+    *,
+    iterator,
+    iterator_base,
+    dataloader,
+    generator,
+    count,
+    model,
+    optimizer,
+    scaler,
+    reference,
+    manifest,
+    sampler,
+    accumulator,
+    global_step,
+):
+    committed_ids = []
+    attempts = []
+    maximum_attempts = count + 24
+    while len(committed_ids) < count:
+        assert len(attempts) < maximum_attempts, (
+            "GradScaler never reached a finite step"
+        )
+        batch = next(iterator)
+        batch_ids = tuple(batch["metadata"]["sample_id"])
+        device_batch = _to_device(batch, torch.device("cuda", 0))
+        metrics = train_step(
+            model,
+            device_batch,
+            optimizer,
+            scaler,
+            reference,
+            manifest,
+            amp=True,
+            grad_clip_norm=1.0,
+            trajectory_weight=12.0,
+            preservation_weight=1.0e-3,
+        )
+        attempts.append((batch_ids, metrics.optimizer_step_applied))
+        assert all(
+            math.isfinite(value)
+            for value in (
+                metrics.total_loss,
+                metrics.trajectory_loss,
+                metrics.preservation_loss,
+                metrics.grad_norm,
+            )
+        )
+        if not metrics.optimizer_step_applied:
+            current_generator_state = generator.get_state().clone()
+            del iterator, device_batch, batch
+            iterator, _ = create_dataloader_iterator(
+                dataloader,
+                generator,
+                iterator_base_state=iterator_base,
+                current_generator_state=current_generator_state,
+            )
+            continue
+        assert metrics.grad_norm > 0.0
+        batch_size = int(device_batch["trajectory"].shape[0])
+        sampler.mark_consumed(batch_size)
+        accumulator = _advance_accumulator(accumulator, metrics, batch_size)
+        global_step += 1
+        committed_ids.extend(batch_ids)
+    return iterator, accumulator, global_step, committed_ids, attempts
 
 
 def _assert_mid_epoch_resume_exact(
@@ -507,18 +737,258 @@ def test_two_worker_prefetch_mid_epoch_resume_is_exact(
 
 
 @pytest.mark.gpu
+@pytest.mark.upstream
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_real_cuda_amp_mid_epoch_resume_is_finite_and_continuous(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _assert_mid_epoch_resume_exact(
-        tmp_path,
-        monkeypatch,
-        num_workers=0,
-        device=torch.device("cuda", 0),
-        explicit_run_ahead=True,
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
+    monkeypatch.setenv("MPLCONFIGDIR", str(tmp_path / "matplotlib"))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    monkeypatch.setattr(torch.backends.cudnn, "benchmark", False)
+    monkeypatch.setattr(torch.backends.cudnn, "deterministic", True)
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    assets = _real_sel_assets()
+
+    (
+        full_model,
+        full_manifest,
+        full_reference,
+        full_optimizer,
+        full_scaler,
+        full_sampler,
+        full_generator,
+        full_loader,
+    ) = _new_real_cuda_training_objects(assets)
+    _seed_real_cuda_run()
+    full_iterator, full_base = create_dataloader_iterator(full_loader, full_generator)
+    (
+        full_iterator,
+        full_accumulator,
+        full_global_step,
+        full_ids,
+        full_attempts,
+    ) = _run_real_cuda_committed_steps(
+        iterator=full_iterator,
+        iterator_base=full_base,
+        dataloader=full_loader,
+        generator=full_generator,
+        count=2,
+        model=full_model,
+        optimizer=full_optimizer,
+        scaler=full_scaler,
+        reference=full_reference,
+        manifest=full_manifest,
+        sampler=full_sampler,
+        accumulator=_zero_accumulator(),
+        global_step=0,
     )
+    torch.cuda.synchronize()
+    full_rng = capture_rng_state(
+        full_generator,
+        dataloader_iterator_base_cpu=full_base,
+    )
+    full_mutable = _owned_cpu(extract_mutable_state(full_model, full_manifest))
+    full_optimizer_state = _owned_cpu(full_optimizer.state_dict())
+    full_scaler_state = _owned_cpu(full_scaler.state_dict())
+    full_sampler_state = full_sampler.state_dict()
+    _assert_finite_nested(full_mutable)
+    _assert_finite_nested(full_optimizer_state)
+    del (
+        full_iterator,
+        full_loader,
+        full_generator,
+        full_sampler,
+        full_scaler,
+        full_optimizer,
+        full_reference,
+        full_model,
+    )
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    (
+        interrupted_model,
+        interrupted_manifest,
+        interrupted_reference,
+        interrupted_optimizer,
+        interrupted_scaler,
+        interrupted_sampler,
+        interrupted_generator,
+        interrupted_loader,
+    ) = _new_real_cuda_training_objects(assets)
+    _seed_real_cuda_run()
+    interrupted_iterator, interrupted_base = create_dataloader_iterator(
+        interrupted_loader, interrupted_generator
+    )
+    (
+        interrupted_iterator,
+        interrupted_accumulator,
+        interrupted_global_step,
+        first_ids,
+        first_attempts,
+    ) = _run_real_cuda_committed_steps(
+        iterator=interrupted_iterator,
+        iterator_base=interrupted_base,
+        dataloader=interrupted_loader,
+        generator=interrupted_generator,
+        count=1,
+        model=interrupted_model,
+        optimizer=interrupted_optimizer,
+        scaler=interrupted_scaler,
+        reference=interrupted_reference,
+        manifest=interrupted_manifest,
+        sampler=interrupted_sampler,
+        accumulator=_zero_accumulator(),
+        global_step=0,
+    )
+    saved_rng = capture_rng_state(
+        interrupted_generator,
+        dataloader_iterator_base_cpu=interrupted_base,
+    )
+    checkpoint_path = tmp_path / "real-ddv2-last.pt"
+    save_training_checkpoint(
+        checkpoint_path,
+        mutable_state=extract_mutable_state(
+            interrupted_model,
+            interrupted_manifest,
+        ),
+        optimizer=interrupted_optimizer,
+        scaler=interrupted_scaler,
+        epoch=0,
+        global_step=interrupted_global_step,
+        best_micro_ade=math.inf,
+        rng=saved_rng,
+        sampler_state=interrupted_sampler.state_dict(),
+        accumulator=interrupted_accumulator,
+        completed_epoch_record_sha256=None,
+        base_checkpoint_sha256=_REAL_CHECKPOINT_SHA256,
+        manifest=interrupted_manifest,
+        config={"checkpoint_interval_steps": 1},
+    )
+    del (
+        interrupted_iterator,
+        interrupted_loader,
+        interrupted_generator,
+        interrupted_sampler,
+        interrupted_scaler,
+        interrupted_optimizer,
+        interrupted_reference,
+        interrupted_model,
+    )
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    (
+        resumed_model,
+        resumed_manifest,
+        resumed_reference,
+        resumed_optimizer,
+        resumed_scaler,
+        resumed_sampler,
+        resumed_generator,
+        resumed_loader,
+    ) = _new_real_cuda_training_objects(assets)
+    resume = load_training_checkpoint(
+        checkpoint_path,
+        model=resumed_model,
+        optimizer=resumed_optimizer,
+        scaler=resumed_scaler,
+        sampler=resumed_sampler,
+        manifest=resumed_manifest,
+        expected_base_checkpoint_sha256=_REAL_CHECKPOINT_SHA256,
+    )
+    assert resume.epoch == 0
+    assert resume.global_step == interrupted_global_step == 1
+    assert resume.accumulator == interrupted_accumulator
+    assert resume.sampler.committed_cursor == 1
+    restore_rng_state(resume.rng, resumed_generator)
+    resumed_iterator, resumed_base = create_dataloader_iterator(
+        resumed_loader,
+        resumed_generator,
+        iterator_base_state=resume.rng.dataloader_iterator_base_cpu,
+        current_generator_state=resume.rng.dataloader_cpu,
+    )
+    (
+        resumed_iterator,
+        resumed_accumulator,
+        resumed_global_step,
+        remaining_ids,
+        remaining_attempts,
+    ) = _run_real_cuda_committed_steps(
+        iterator=resumed_iterator,
+        iterator_base=resumed_base,
+        dataloader=resumed_loader,
+        generator=resumed_generator,
+        count=1,
+        model=resumed_model,
+        optimizer=resumed_optimizer,
+        scaler=resumed_scaler,
+        reference=resumed_reference,
+        manifest=resumed_manifest,
+        sampler=resumed_sampler,
+        accumulator=resume.accumulator,
+        global_step=resume.global_step,
+    )
+    torch.cuda.synchronize()
+    resumed_rng = capture_rng_state(
+        resumed_generator,
+        dataloader_iterator_base_cpu=resumed_base,
+    )
+
+    assert first_ids + remaining_ids == full_ids
+    assert first_attempts + remaining_attempts == full_attempts
+    assert resumed_global_step == full_global_step == 2
+    assert resumed_accumulator.epoch == full_accumulator.epoch == 0
+    assert resumed_accumulator.completed_batches == 2
+    assert resumed_accumulator.completed_samples == 2
+    assert resumed_accumulator.grad_norm_count == 2
+    assert resumed_accumulator.total_loss_numerator == pytest.approx(
+        full_accumulator.total_loss_numerator,
+        rel=1.0e-4,
+        abs=1.0e-6,
+    )
+    assert resumed_accumulator.trajectory_loss_numerator == pytest.approx(
+        full_accumulator.trajectory_loss_numerator,
+        rel=1.0e-4,
+        abs=1.0e-6,
+    )
+    assert resumed_accumulator.preservation_loss_numerator == pytest.approx(
+        full_accumulator.preservation_loss_numerator,
+        rel=1.0e-4,
+        abs=1.0e-8,
+    )
+    assert resumed_accumulator.grad_norm_sum == pytest.approx(
+        full_accumulator.grad_norm_sum,
+        rel=1.0e-4,
+        abs=1.0e-6,
+    )
+    resumed_mutable = _owned_cpu(extract_mutable_state(resumed_model, resumed_manifest))
+    _assert_finite_nested(resumed_mutable)
+    _assert_finite_nested(resumed_optimizer.state_dict())
+    for name, full_tensor in full_mutable.items():
+        torch.testing.assert_close(
+            resumed_mutable[name],
+            full_tensor,
+            rtol=1.0e-4,
+            atol=1.0e-6,
+        )
+    _assert_nested_close(
+        _owned_cpu(resumed_optimizer.state_dict()),
+        full_optimizer_state,
+    )
+    _assert_nested_equal(resumed_scaler.state_dict(), full_scaler_state)
+    resumed_sampler_state = resumed_sampler.state_dict()
+    assert resumed_sampler_state.epoch == full_sampler_state.epoch == 0
+    assert resumed_sampler_state.committed_cursor == 2
+    _assert_nested_equal(
+        resumed_sampler_state.__dict__,
+        full_sampler_state.__dict__,
+    )
+    _assert_rng_equal(resumed_rng, full_rng)
 
 
 def test_train_one_epoch_retries_overflow_without_advancing_committed_state(
@@ -594,6 +1064,63 @@ def test_train_one_epoch_retries_overflow_without_advancing_committed_state(
     assert accumulator == _zero_accumulator()
     assert not model.training
     assert model._backbone.image_encoder.training
+
+
+def test_train_one_epoch_requires_saved_rng_for_committed_mid_epoch_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from morai_ddv2.training import trainer as trainer_module
+
+    model = _ResumeModel()
+    manifest = configure_training_boundary(model)
+    reference = snapshot_source_parameters(model, manifest)
+    optimizer = build_optimizer(model, manifest, lr=1.0e-3, weight_decay=0.0)
+    scaler = torch.cuda.amp.GradScaler(enabled=False)
+    dataset = _ResumeDataset(size=4)
+    sampler = StatefulPermutationSampler(dataset, seed=851)
+    sampler.mark_consumed(2)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(852)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=2,
+        sampler=sampler,
+        num_workers=0,
+        generator=generator,
+    )
+    accumulator = EpochAccumulatorState(
+        epoch=0,
+        completed_batches=1,
+        completed_samples=2,
+        total_loss_numerator=2.0,
+        trajectory_loss_numerator=4.0,
+        preservation_loss_numerator=6.0,
+        grad_norm_sum=4.0,
+        grad_norm_count=1,
+    )
+    monkeypatch.setattr(
+        trainer_module,
+        "train_step",
+        lambda *_args, **_kwargs: StepMetrics(1.0, 2.0, 3.0, 4.0, True),
+    )
+
+    with pytest.raises(ResumeContractError, match="resume RNG"):
+        train_one_epoch(
+            model=model,
+            dataloader=dataloader,
+            sampler=sampler,
+            optimizer=optimizer,
+            scaler=scaler,
+            reference=reference,
+            manifest=manifest,
+            amp=False,
+            grad_clip_norm=1.0,
+            trajectory_weight=12.0,
+            preservation_weight=1.0e-3,
+            epoch=0,
+            global_step=1,
+            accumulator=accumulator,
+        )
 
 
 @pytest.mark.filterwarnings("ignore:Can't initialize NVML")
