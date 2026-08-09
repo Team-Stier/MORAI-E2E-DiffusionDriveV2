@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Mapping
 import copy
+import hashlib
 import io
 import math
 from pathlib import Path
@@ -263,19 +264,147 @@ def save_training_checkpoint(
     atomic_write_bytes(Path(path), stream.getvalue())
 
 
-def _load_payload(path: Path) -> Mapping[str, Any]:
+def _load_payload(
+    path: Path, *, expected_checkpoint_sha256: Optional[str] = None
+) -> Mapping[str, Any]:
     checkpoint_path = Path(path)
     if not checkpoint_path.is_file():
         raise ResumeContractError(
             f"training checkpoint is not a file: {checkpoint_path}"
         )
     try:
-        payload = torch.load(str(checkpoint_path), map_location="cpu")
+        checkpoint_bytes = checkpoint_path.read_bytes()
+    except Exception as error:
+        raise ResumeContractError("unable to read training checkpoint") from error
+    if expected_checkpoint_sha256 is not None:
+        expected_checkpoint_sha256 = _require_sha256(
+            expected_checkpoint_sha256,
+            "expected training checkpoint hash",
+        )
+        if hashlib.sha256(checkpoint_bytes).hexdigest() != expected_checkpoint_sha256:
+            raise ResumeContractError("training checkpoint SHA-256 changed")
+    try:
+        payload = torch.load(io.BytesIO(checkpoint_bytes), map_location="cpu")
     except Exception as error:
         raise ResumeContractError("unable to load training checkpoint") from error
     if not isinstance(payload, Mapping) or set(payload) != _CHECKPOINT_KEYS:
         raise ResumeContractError("training checkpoint schema is invalid")
     return payload
+
+
+def _config_identity(config: Mapping[str, Any]) -> Mapping[str, Any]:
+    identity = dict(config)
+    identity.pop("resume_checkpoint_sha256", None)
+    return identity
+
+
+def _validated_checkpoint_payload(
+    payload: Mapping[str, Any],
+    *,
+    expected_base_checkpoint_sha256: str,
+    expected_checkpoint_sha256: Optional[str] = None,
+    expected_config: Optional[Mapping[str, Any]] = None,
+    expected_identities: Optional[Mapping[str, str]] = None,
+    expected_manifest: Optional[FreezeManifest] = None,
+) -> Mapping[str, Any]:
+    expected_base = _require_sha256(
+        expected_base_checkpoint_sha256,
+        "expected base checkpoint hash",
+    )
+    if payload["base_checkpoint_sha256"] != expected_base:
+        raise TrainingBoundaryError("base checkpoint identity does not match resume")
+    checkpoint_manifest = _validated_manifest(payload["manifest"])
+    if expected_manifest is not None and checkpoint_manifest != expected_manifest:
+        raise TrainingBoundaryError("freeze manifest identity does not match resume")
+    epoch, global_step = _validated_epoch_and_step(
+        payload["epoch"], payload["global_step"]
+    )
+    best = _validated_best(payload["best_micro_ade"])
+    completed_hash = _require_optional_sha256(
+        payload["completed_epoch_record_sha256"],
+        "completed epoch record hash",
+    )
+    rng = clone_rng_state(payload["rng"])
+    sampler_state = _owned_sampler_state(payload["sampler_state"])
+    accumulator = _validated_accumulator(
+        payload["accumulator"],
+        sampler_state,
+        epoch=epoch,
+        global_step=global_step,
+    )
+    mutable_state = _owned_mutable_state(payload["mutable_state"], checkpoint_manifest)
+    if not isinstance(payload["optimizer"], Mapping) or not isinstance(
+        payload["scaler"], Mapping
+    ):
+        raise ResumeContractError("optimizer or scaler checkpoint state is invalid")
+    if not isinstance(payload["config"], Mapping):
+        raise ResumeContractError("training config checkpoint state is invalid")
+    stored_config = dict(payload["config"])
+    if expected_identities is not None:
+        if not isinstance(expected_identities, Mapping):
+            raise TypeError("expected_identities must be a mapping")
+        stored_identities = stored_config.get("identities")
+        if not isinstance(stored_identities, Mapping) or any(
+            stored_identities.get(name) != value
+            for name, value in expected_identities.items()
+        ):
+            raise ResumeContractError(
+                "training checkpoint identity does not match invocation"
+            )
+    if expected_config is not None:
+        if not isinstance(expected_config, Mapping):
+            raise TypeError("expected_config must be a mapping")
+        bound_resume = expected_config.get("resume_checkpoint_sha256")
+        if bound_resume is not None and bound_resume != expected_checkpoint_sha256:
+            raise ResumeContractError(
+                "resolved run config does not bind the inspected checkpoint"
+            )
+        if _config_identity(stored_config) != _config_identity(expected_config):
+            raise ResumeContractError(
+                "resume checkpoint config does not match invocation"
+            )
+    stored_identities = stored_config.get("identities")
+    if isinstance(stored_identities, Mapping) and (
+        stored_identities.get("base_checkpoint_sha256") is not None
+        and stored_identities.get("base_checkpoint_sha256") != expected_base
+    ):
+        raise ResumeContractError(
+            "training checkpoint base identity is internally inconsistent"
+        )
+    return {
+        "mutable_state": mutable_state,
+        "optimizer": payload["optimizer"],
+        "scaler": payload["scaler"],
+        "epoch": epoch,
+        "global_step": global_step,
+        "best_micro_ade": best,
+        "rng": rng,
+        "sampler_state": sampler_state,
+        "accumulator": accumulator,
+        "completed_epoch_record_sha256": completed_hash,
+        "manifest": checkpoint_manifest,
+        "config": stored_config,
+    }
+
+
+def inspect_training_checkpoint(
+    path: Path,
+    *,
+    expected_checkpoint_sha256: str,
+    expected_base_checkpoint_sha256: str,
+    expected_config: Optional[Mapping[str, Any]] = None,
+    expected_identities: Optional[Mapping[str, str]] = None,
+) -> None:
+    payload = _load_payload(
+        Path(path), expected_checkpoint_sha256=expected_checkpoint_sha256
+    )
+    _validated_checkpoint_payload(
+        payload,
+        expected_base_checkpoint_sha256=expected_base_checkpoint_sha256,
+        expected_checkpoint_sha256=expected_checkpoint_sha256,
+        expected_config=expected_config,
+        expected_identities=expected_identities,
+    )
 
 
 def _validated_model_mutable_state(
@@ -324,6 +453,9 @@ def load_training_checkpoint(
     sampler: StatefulPermutationSampler,
     manifest: FreezeManifest,
     expected_base_checkpoint_sha256: str,
+    expected_checkpoint_sha256: Optional[str] = None,
+    expected_config: Optional[Mapping[str, Any]] = None,
+    expected_identities: Optional[Mapping[str, str]] = None,
 ) -> ResumeState:
     if not isinstance(model, nn.Module):
         raise TypeError("model must be an nn.Module")
@@ -331,43 +463,20 @@ def load_training_checkpoint(
         raise TypeError("sampler must be a StatefulPermutationSampler")
     manifest = _validated_manifest(manifest)
     assert_training_boundary(model, manifest)
-    expected_base = _require_sha256(
-        expected_base_checkpoint_sha256,
-        "expected base checkpoint hash",
+    payload = _load_payload(
+        Path(path), expected_checkpoint_sha256=expected_checkpoint_sha256
     )
-    payload = _load_payload(Path(path))
-    if payload["base_checkpoint_sha256"] != expected_base:
-        raise TrainingBoundaryError("base checkpoint identity does not match resume")
-    if (
-        type(payload["manifest"]) is not FreezeManifest
-        or payload["manifest"] != manifest
-    ):
-        raise TrainingBoundaryError("freeze manifest identity does not match resume")
-    epoch, global_step = _validated_epoch_and_step(
-        payload["epoch"], payload["global_step"]
-    )
-    best = _validated_best(payload["best_micro_ade"])
-    completed_hash = _require_optional_sha256(
-        payload["completed_epoch_record_sha256"],
-        "completed epoch record hash",
-    )
-    rng = clone_rng_state(payload["rng"])
-    sampler_state = _owned_sampler_state(payload["sampler_state"])
-    accumulator = _validated_accumulator(
-        payload["accumulator"],
-        sampler_state,
-        epoch=epoch,
-        global_step=global_step,
+    validated = _validated_checkpoint_payload(
+        payload,
+        expected_base_checkpoint_sha256=expected_base_checkpoint_sha256,
+        expected_checkpoint_sha256=expected_checkpoint_sha256,
+        expected_config=expected_config,
+        expected_identities=expected_identities,
+        expected_manifest=manifest,
     )
     mutable_state = _validated_model_mutable_state(
-        model, payload["mutable_state"], manifest
+        model, validated["mutable_state"], manifest
     )
-    if not isinstance(payload["optimizer"], Mapping) or not isinstance(
-        payload["scaler"], Mapping
-    ):
-        raise ResumeContractError("optimizer or scaler checkpoint state is invalid")
-    if not isinstance(payload["config"], Mapping):
-        raise ResumeContractError("training config checkpoint state is invalid")
     if not hasattr(optimizer, "load_state_dict") or not hasattr(
         scaler, "load_state_dict"
     ):
@@ -379,9 +488,9 @@ def load_training_checkpoint(
     previous_sampler = sampler.state_dict()
     try:
         _load_mutable_state(model, mutable_state)
-        optimizer.load_state_dict(payload["optimizer"])
-        scaler.load_state_dict(payload["scaler"])
-        sampler.load_state_dict(sampler_state)
+        optimizer.load_state_dict(validated["optimizer"])
+        scaler.load_state_dict(validated["scaler"])
+        sampler.load_state_dict(validated["sampler_state"])
     except Exception:
         try:
             sampler.load_state_dict(previous_sampler)
@@ -396,14 +505,18 @@ def load_training_checkpoint(
         raise
     assert_training_boundary(model, manifest)
     return ResumeState(
-        epoch=epoch,
-        global_step=global_step,
-        best_micro_ade=best,
+        epoch=validated["epoch"],
+        global_step=validated["global_step"],
+        best_micro_ade=validated["best_micro_ade"],
         sampler=sampler.state_dict(),
-        accumulator=accumulator,
-        completed_epoch_record_sha256=completed_hash,
-        rng=rng,
+        accumulator=validated["accumulator"],
+        completed_epoch_record_sha256=validated["completed_epoch_record_sha256"],
+        rng=validated["rng"],
     )
 
 
-__all__ = ("load_training_checkpoint", "save_training_checkpoint")
+__all__ = (
+    "inspect_training_checkpoint",
+    "load_training_checkpoint",
+    "save_training_checkpoint",
+)

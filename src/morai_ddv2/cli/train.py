@@ -17,12 +17,15 @@ import torch
 import yaml
 
 from morai_ddv2.cache.loader import VerifiedManifest, load_verified_manifest
-from morai_ddv2.config import load_resolved_domain, sha256_file
+from morai_ddv2.cache.manifest import assign_bag_splits
+from morai_ddv2.config import ResolvedDomain, load_resolved_domain, sha256_file
 from morai_ddv2.errors import ConfigurationError, IntegrityError
 from morai_ddv2.training.dataset import (
     TrainingConfig,
     build_dataloaders,
 )
+from morai_ddv2.training.checkpoint import inspect_training_checkpoint
+from morai_ddv2.training.metrics import DOMAIN_ID
 from morai_ddv2.training.trainer import fit
 from morai_ddv2.upstream import SelAssets, load_pdm_free_sel_network
 
@@ -32,6 +35,26 @@ _TRAINING_FIELDS = tuple(TrainingConfig.__dataclass_fields__)
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 _DDV2_COMMIT = "1cd12a1e155c34dcc471261835444c8d5587580b"
+_VALIDATOR_COMMIT = "09a3b88e19ae3354903ed676a35e02416284cb58"
+_PREPROCESSING_SOURCE_COMMIT = "c2140f2177d69d33f21b8bc1045bda6670e82d16"
+_RESOLVED_DOMAIN_SHA256 = (
+    "4aeee4bf28297da2e34cb7a7028a59c95b971c6dcc4c66f90a2cf54bd891350c"
+)
+_DERIVATIVE_RELATIVE_PATH = Path(
+    "navsim/agents/diffusiondrivev2/diffusiondrivev2_model_sel_inference.py"
+)
+_CHECKPOINT_IDENTITY_FIELDS = (
+    "domain_id",
+    "training_manifest_sha256",
+    "resolved_domain_sha256",
+    "sensor_preset_sha256",
+    "base_profile_sha256",
+    "base_checkpoint_sha256",
+    "ddv2_source_commit",
+    "validator_source_commit",
+    "preprocessing_source_commit",
+    "training_source_commit",
+)
 _ASSET_HASHES = {
     "checkpoint": "452c4e0dd328c49b981f3fd5ed13eb1c6a2b0f3a9486adf43b40a5645ed543b1",
     "image_backbone": "f6c1d7785b5d0e796a83f9643fe2cb952ac95740daa9fb2d5c8c6514fdadaeb3",
@@ -194,6 +217,11 @@ def _profile_assets(profile_path: Path) -> Tuple[SelAssets, str, str]:
     if set(by_role) != set(_ASSET_HASHES):
         raise IntegrityError("base profile runtime asset roles are invalid")
     validator_root = _validator_root(profile_path)
+    validator_commit = _git_output(
+        validator_root, ("rev-parse", "HEAD"), "Validator checkout commit"
+    )
+    if validator_commit != _VALIDATOR_COMMIT:
+        raise IntegrityError("Validator checkout does not match the pinned commit")
     paths: Dict[str, Path] = {}
     for role, expected_sha256 in _ASSET_HASHES.items():
         declaration = by_role[role]
@@ -217,18 +245,46 @@ def _profile_assets(profile_path: Path) -> Tuple[SelAssets, str, str]:
         if not candidate.is_file() or sha256_file(candidate) != expected_sha256:
             raise IntegrityError(f"base profile {role} asset is missing or corrupt")
         paths[role] = candidate
-    v2_checkout = _PROJECT_ROOT / "third_party/DiffusionDriveV2"
+    official_checkout = _PROJECT_ROOT / "third_party/DiffusionDriveV2"
     observed_commit = _git_output(
-        v2_checkout, ("rev-parse", "HEAD"), "DDV2 checkout commit"
+        official_checkout, ("rev-parse", "HEAD"), "DDV2 checkout commit"
     )
     if observed_commit != _DDV2_COMMIT:
         raise IntegrityError("DDV2 checkout does not match the pinned commit")
-    derivative = (
-        v2_checkout
-        / "navsim/agents/diffusiondrivev2/diffusiondrivev2_model_sel_inference.py"
+    v2_checkout = validator_root / "models/sources/diffusiondrive_v2"
+    fetched_commit = _git_output(
+        v2_checkout, ("rev-parse", "HEAD"), "fetched DDV2 source commit"
     )
-    if not derivative.is_file():
-        raise IntegrityError("PDM-free DDV2 derivative is missing")
+    if fetched_commit != _DDV2_COMMIT:
+        raise IntegrityError("fetched DDV2 source does not match the pinned commit")
+    asset_manifest = _load_json(
+        validator_root / "models/diffusiondrive_v2/asset-manifest.json",
+        "DDV2 asset manifest",
+    )
+    manifest_source = asset_manifest.get("source")
+    derivative_metadata = (
+        manifest_source.get("local_derivative")
+        if isinstance(manifest_source, Mapping)
+        else None
+    )
+    if (
+        asset_manifest.get("model_id") != "diffusiondrive_v2"
+        or not isinstance(manifest_source, Mapping)
+        or manifest_source.get("commit") != _DDV2_COMMIT
+        or manifest_source.get("observed_commit") != _DDV2_COMMIT
+        or not isinstance(derivative_metadata, Mapping)
+        or derivative_metadata.get("path") != _DERIVATIVE_RELATIVE_PATH.as_posix()
+    ):
+        raise IntegrityError("DDV2 fetched source manifest is invalid")
+    derivative = v2_checkout / _DERIVATIVE_RELATIVE_PATH
+    derivative_sha256 = derivative_metadata.get("sha256")
+    if (
+        type(derivative_sha256) is not str
+        or _SHA256.fullmatch(derivative_sha256) is None
+        or not derivative.is_file()
+        or sha256_file(derivative) != derivative_sha256
+    ):
+        raise IntegrityError("PDM-free DDV2 derivative is missing or corrupt")
     return (
         SelAssets(
             v2_checkout=v2_checkout,
@@ -258,7 +314,7 @@ def build_resolved_run_config(
         or _SHA256.fullmatch(resume_checkpoint_sha256) is None
     ):
         raise ValueError("resume checkpoint hash must be a lowercase SHA-256")
-    return {
+    resolved = {
         "schema_version": 1,
         "training": asdict(config),
         "identities": dict(identities),
@@ -268,6 +324,9 @@ def build_resolved_run_config(
             "max_validation_samples": max_validation_samples,
         },
     }
+    if resume_checkpoint_sha256 is not None:
+        resolved["resume_checkpoint_sha256"] = resume_checkpoint_sha256
+    return resolved
 
 
 def _manifest_statistics(
@@ -303,10 +362,59 @@ def _manifest_statistics(
     return drops, sync
 
 
+def _validate_production_domain(resolved: ResolvedDomain) -> None:
+    if type(resolved) is not ResolvedDomain:
+        raise TypeError("resolved must be a ResolvedDomain")
+    if (
+        resolved.sha256 != _RESOLVED_DOMAIN_SHA256
+        or resolved.document.get("domain_id") != DOMAIN_ID
+        or resolved.document.get("source_code_commit") != _PREPROCESSING_SOURCE_COMMIT
+    ):
+        raise IntegrityError("resolved domain is not the corrected Option D identity")
+
+
+def _validate_production_manifest(
+    resolved: ResolvedDomain, manifest: VerifiedManifest
+) -> None:
+    if type(manifest) is not VerifiedManifest:
+        raise TypeError("manifest must be a VerifiedManifest")
+    resolved_commit = resolved.document.get("source_code_commit")
+    if manifest.dataset_record.get("source_code_commit") != resolved_commit:
+        raise IntegrityError(
+            "manifest source commit does not match resolved domain source commit"
+        )
+    eligible = tuple(
+        bag for bag in manifest.bag_records if bag.get("disposition") == "ELIGIBLE"
+    )
+    if len(eligible) != 30:
+        raise IntegrityError("MORAI production manifest must contain 30 eligible bags")
+    expected_splits = assign_bag_splits(
+        [str(bag["relative_bag_path"]) for bag in eligible]
+    )
+    actual_splits = {
+        str(bag["relative_bag_path"]): bag.get("split") for bag in eligible
+    }
+    train_paths = [path for path, split in expected_splits.items() if split == "train"]
+    validation_paths = [
+        path for path, split in expected_splits.items() if split == "validation"
+    ]
+    if (
+        actual_splits != dict(expected_splits)
+        or len(train_paths) != 24
+        or len(validation_paths) != 6
+        or list(manifest.dataset_record.get("train_relative_bag_paths", ()))
+        != train_paths
+        or list(manifest.dataset_record.get("validation_relative_bag_paths", ()))
+        != validation_paths
+    ):
+        raise IntegrityError("MORAI production manifest must use the exact 24/6 split")
+
+
 def preflight_training(arguments: argparse.Namespace) -> TrainingPreflight:
     assert_runtime_contract(require_cuda=True)
     config = load_training_config(arguments.config)
     resolved = load_resolved_domain(arguments.resolved_domain)
+    _validate_production_domain(resolved)
     document = resolved.document
     domain_id = document.get("domain_id")
     source = document.get("sensor_preset")
@@ -336,9 +444,10 @@ def preflight_training(arguments: argparse.Namespace) -> TrainingPreflight:
         resolved.sha256,
         production=True,
     )
+    _validate_production_manifest(resolved, manifest)
     preprocessing_commit = _require_commit_object(
         _PROJECT_ROOT,
-        manifest.dataset_record["source_code_commit"],
+        document["source_code_commit"],
         "preprocessing source commit",
     )
     training_commit = _require_commit_object(
@@ -355,6 +464,7 @@ def preflight_training(arguments: argparse.Namespace) -> TrainingPreflight:
         "base_profile_sha256": profile_sha256,
         "base_checkpoint_sha256": base_sha256,
         "ddv2_source_commit": _DDV2_COMMIT,
+        "validator_source_commit": _VALIDATOR_COMMIT,
         "preprocessing_source_commit": preprocessing_commit,
         "training_source_commit": training_commit,
     }
@@ -371,6 +481,14 @@ def preflight_training(arguments: argparse.Namespace) -> TrainingPreflight:
         max_train_batches=arguments.max_train_batches,
         max_validation_samples=arguments.max_validation_samples,
     )
+    if arguments.resume is not None:
+        inspect_training_checkpoint(
+            arguments.resume,
+            expected_checkpoint_sha256=resume_sha256,
+            expected_base_checkpoint_sha256=base_sha256,
+            expected_config=resolved_run_config,
+            expected_identities=identities,
+        )
     drops, sync = _manifest_statistics(manifest)
     return TrainingPreflight(
         config=config,

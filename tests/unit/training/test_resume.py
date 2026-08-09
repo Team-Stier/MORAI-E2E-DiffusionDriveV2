@@ -18,7 +18,9 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
+from morai_ddv2.config import sha256_file
 from morai_ddv2.training.checkpoint import (
+    inspect_training_checkpoint,
     load_training_checkpoint,
     save_training_checkpoint,
 )
@@ -121,6 +123,132 @@ def _zero_accumulator() -> EpochAccumulatorState:
         grad_norm_sum=0.0,
         grad_norm_count=0,
     )
+
+
+def test_model_free_checkpoint_inspection_accepts_bound_resume_identity_and_rejects_replacement(
+    tmp_path: Path,
+) -> None:
+    (
+        model,
+        manifest,
+        _reference,
+        optimizer,
+        scaler,
+        sampler,
+        generator,
+        _loader,
+    ) = _new_training_objects(num_workers=0)
+    stored_config = {
+        "schema_version": 1,
+        "training": {"epochs": 30},
+        "identities": {
+            "training_manifest_sha256": "1" * 64,
+            "resolved_domain_sha256": "2" * 64,
+            "base_checkpoint_sha256": "3" * 64,
+        },
+        "smoke_bounds": {
+            "max_epochs": None,
+            "max_train_batches": None,
+            "max_validation_samples": None,
+        },
+    }
+    checkpoint = tmp_path / "last.pt"
+    save_training_checkpoint(
+        checkpoint,
+        mutable_state=extract_mutable_state(model, manifest),
+        optimizer=optimizer,
+        scaler=scaler,
+        epoch=0,
+        global_step=0,
+        best_micro_ade=math.inf,
+        rng=capture_rng_state(
+            generator,
+            dataloader_iterator_base_cpu=generator.get_state().clone(),
+        ),
+        sampler_state=sampler.state_dict(),
+        accumulator=_zero_accumulator(),
+        completed_epoch_record_sha256=None,
+        base_checkpoint_sha256="3" * 64,
+        manifest=manifest,
+        config=stored_config,
+    )
+    checkpoint_sha256 = sha256_file(checkpoint)
+    resume_config = dict(stored_config)
+    resume_config["resume_checkpoint_sha256"] = checkpoint_sha256
+
+    inspect_training_checkpoint(
+        checkpoint,
+        expected_checkpoint_sha256=checkpoint_sha256,
+        expected_base_checkpoint_sha256="3" * 64,
+        expected_config=resume_config,
+        expected_identities={"training_manifest_sha256": "1" * 64},
+    )
+
+    checkpoint.write_bytes(checkpoint.read_bytes() + b"replaced")
+    with pytest.raises(ResumeContractError, match="SHA-256"):
+        inspect_training_checkpoint(
+            checkpoint,
+            expected_checkpoint_sha256=checkpoint_sha256,
+            expected_base_checkpoint_sha256="3" * 64,
+            expected_config=resume_config,
+        )
+
+
+def test_model_free_checkpoint_inspection_rejects_cache_identity_mismatch(
+    tmp_path: Path,
+) -> None:
+    (
+        model,
+        manifest,
+        _reference,
+        optimizer,
+        scaler,
+        sampler,
+        generator,
+        _loader,
+    ) = _new_training_objects(num_workers=0)
+    config = {
+        "schema_version": 1,
+        "training": {},
+        "identities": {
+            "training_manifest_sha256": "1" * 64,
+            "resolved_domain_sha256": "2" * 64,
+            "base_checkpoint_sha256": "3" * 64,
+        },
+        "smoke_bounds": {
+            "max_epochs": None,
+            "max_train_batches": None,
+            "max_validation_samples": None,
+        },
+    }
+    checkpoint = tmp_path / "other-cache.pt"
+    save_training_checkpoint(
+        checkpoint,
+        mutable_state=extract_mutable_state(model, manifest),
+        optimizer=optimizer,
+        scaler=scaler,
+        epoch=0,
+        global_step=0,
+        best_micro_ade=math.inf,
+        rng=capture_rng_state(
+            generator,
+            dataloader_iterator_base_cpu=generator.get_state().clone(),
+        ),
+        sampler_state=sampler.state_dict(),
+        accumulator=_zero_accumulator(),
+        completed_epoch_record_sha256=None,
+        base_checkpoint_sha256="3" * 64,
+        manifest=manifest,
+        config=config,
+    )
+
+    with pytest.raises(ResumeContractError, match="identity"):
+        inspect_training_checkpoint(
+            checkpoint,
+            expected_checkpoint_sha256=sha256_file(checkpoint),
+            expected_base_checkpoint_sha256="3" * 64,
+            expected_identities={"training_manifest_sha256": "9" * 64},
+        )
 
 
 def _advance_accumulator(

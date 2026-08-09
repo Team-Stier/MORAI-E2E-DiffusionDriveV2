@@ -12,7 +12,10 @@ from morai_ddv2.atomic import atomic_write_bytes
 from morai_ddv2.cache.loader import VerifiedManifest, load_verified_manifest
 from morai_ddv2.config import load_resolved_domain, sha256_file
 from morai_ddv2.errors import IntegrityError
-from morai_ddv2.training.checkpoint import load_training_checkpoint
+from morai_ddv2.training.checkpoint import (
+    inspect_training_checkpoint,
+    load_training_checkpoint,
+)
 from morai_ddv2.training.dataset import (
     MoraiTrainingDataset,
     TrainingConfig,
@@ -24,12 +27,18 @@ from morai_ddv2.training.validation import validate_selector_b1
 from morai_ddv2.upstream import SelAssets, load_pdm_free_sel_network
 
 from .train import (
+    _CHECKPOINT_IDENTITY_FIELDS,
+    _DDV2_COMMIT,
     _PROJECT_ROOT,
+    _VALIDATOR_COMMIT,
     _git_output,
     _manifest_statistics,
     _profile_assets,
     _require_commit_object,
+    _validate_production_domain,
+    _validate_production_manifest,
     assert_runtime_contract,
+    build_resolved_run_config,
 )
 
 
@@ -43,6 +52,8 @@ class EvaluationPreflight:
     manifest: VerifiedManifest
     assets: SelAssets
     identities: Mapping[str, str]
+    checkpoint_identities: Mapping[str, str]
+    checkpoint_config: Mapping[str, Any]
     base_checkpoint_sha256: str
     training_checkpoint: Path
     drop_statistics: Mapping[str, int]
@@ -71,6 +82,7 @@ def _parser() -> argparse.ArgumentParser:
 def preflight_evaluation(arguments: argparse.Namespace) -> EvaluationPreflight:
     assert_runtime_contract(require_cuda=False)
     resolved = load_resolved_domain(arguments.resolved_domain)
+    _validate_production_domain(resolved)
     document = resolved.document
     domain_id = document.get("domain_id")
     source = document.get("sensor_preset")
@@ -99,9 +111,10 @@ def preflight_evaluation(arguments: argparse.Namespace) -> EvaluationPreflight:
         resolved.sha256,
         production=True,
     )
+    _validate_production_manifest(resolved, manifest)
     preprocessing_commit = _require_commit_object(
         _PROJECT_ROOT,
-        manifest.dataset_record["source_code_commit"],
+        document["source_code_commit"],
         "preprocessing source commit",
     )
     training_commit = _require_commit_object(
@@ -113,6 +126,7 @@ def preflight_evaluation(arguments: argparse.Namespace) -> EvaluationPreflight:
     checkpoint = Path(arguments.training_checkpoint)
     if not checkpoint.is_file():
         raise IntegrityError("training checkpoint is not a file")
+    checkpoint_sha256 = sha256_file(checkpoint)
     identities = {
         "domain_id": domain_id,
         "training_manifest_sha256": manifest.manifest_sha256,
@@ -120,15 +134,38 @@ def preflight_evaluation(arguments: argparse.Namespace) -> EvaluationPreflight:
         "sensor_preset_sha256": str(source["sha256"]),
         "base_profile_sha256": profile_sha256,
         "base_checkpoint_sha256": base_sha256,
-        "training_checkpoint_sha256": sha256_file(checkpoint),
+        "ddv2_source_commit": _DDV2_COMMIT,
+        "validator_source_commit": _VALIDATOR_COMMIT,
+        "training_checkpoint_sha256": checkpoint_sha256,
         "preprocessing_source_commit": preprocessing_commit,
+        "training_source_commit": training_commit,
         "evaluation_source_commit": training_commit,
     }
+    checkpoint_identities = {
+        name: identities[name] for name in _CHECKPOINT_IDENTITY_FIELDS
+    }
+    checkpoint_config = build_resolved_run_config(
+        config=TrainingConfig(),
+        identities=checkpoint_identities,
+        resume_checkpoint_sha256=None,
+        max_epochs=None,
+        max_train_batches=None,
+        max_validation_samples=None,
+    )
+    inspect_training_checkpoint(
+        checkpoint,
+        expected_checkpoint_sha256=checkpoint_sha256,
+        expected_base_checkpoint_sha256=base_sha256,
+        expected_config=checkpoint_config,
+        expected_identities=checkpoint_identities,
+    )
     drops, sync = _manifest_statistics(manifest)
     return EvaluationPreflight(
         manifest=manifest,
         assets=assets,
         identities=identities,
+        checkpoint_identities=checkpoint_identities,
+        checkpoint_config=checkpoint_config,
         base_checkpoint_sha256=base_sha256,
         training_checkpoint=checkpoint,
         drop_statistics=drops,
@@ -191,6 +228,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         sampler=sampler,
         manifest=manifest,
         expected_base_checkpoint_sha256=preflight.base_checkpoint_sha256,
+        expected_checkpoint_sha256=preflight.identities["training_checkpoint_sha256"],
+        expected_config=preflight.checkpoint_config,
+        expected_identities=preflight.checkpoint_identities,
     )
     samples = MoraiTrainingDataset(preflight.manifest, split="validation")
     evaluate_offline(

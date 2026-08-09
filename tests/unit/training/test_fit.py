@@ -13,6 +13,7 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
 import morai_ddv2.training.trainer as trainer_module
+from morai_ddv2.config import sha256_file
 from morai_ddv2.training.contracts import ProductionRunAttestation
 from morai_ddv2.training.dataset import TrainingConfig
 from morai_ddv2.training.metrics import PredictionRecord, compute_openloop_metrics
@@ -343,6 +344,10 @@ def test_bounded_fit_publishes_only_debug_allowlist_and_stops_at_bounds(
     resumed_train, resumed_validation, resumed_sampler, resumed_generator = _loaders(
         config
     )
+    resume_resolved = {
+        **resolved,
+        "resume_checkpoint_sha256": sha256_file(tmp_path / "debug/last.pt"),
+    }
     fit(
         model=resumed_model,
         train_dataloader=resumed_train,
@@ -351,7 +356,7 @@ def test_bounded_fit_publishes_only_debug_allowlist_and_stops_at_bounds(
         dataloader_generator=resumed_generator,
         config=config,
         run_dir=tmp_path,
-        resolved_run_config=resolved,
+        resolved_run_config=resume_resolved,
         identities=identities,
         base_checkpoint_sha256="5" * 64,
         resume_path=tmp_path / "debug/last.pt",
@@ -366,6 +371,11 @@ def test_bounded_fit_publishes_only_debug_allowlist_and_stops_at_bounds(
     assert resumed_checkpoint["sampler_state"].committed_cursor == 0
     assert resumed_checkpoint["accumulator"].epoch == 1
     assert resumed_checkpoint["accumulator"].completed_batches == 0
+    assert resumed_checkpoint["config"] == resume_resolved
+    assert (
+        json.loads((tmp_path / "debug/resolved-run-config.json").read_text())
+        == resume_resolved
+    )
 
     partial_copy = tmp_path / "partial-copy.pt"
     partial_copy.write_bytes(partial_checkpoint_bytes)
@@ -529,11 +539,16 @@ def test_resume_reconciles_durable_epoch_before_sampler_finished_checkpoint(
 
     assert validation_calls == ["selector", "loss"]
     assert not (tmp_path / "run-complete.json").exists()
+    stable_config_bytes = (tmp_path / "resolved-run-config.json").read_bytes()
     resumed_model = _TinyModel()
     resumed_train, resumed_validation, resumed_sampler, resumed_generator = _loaders(
         config
     )
 
+    resume_resolved = {
+        **resolved,
+        "resume_checkpoint_sha256": sha256_file(tmp_path / "last.pt"),
+    }
     attestation = fit(
         model=resumed_model,
         train_dataloader=resumed_train,
@@ -542,7 +557,7 @@ def test_resume_reconciles_durable_epoch_before_sampler_finished_checkpoint(
         dataloader_generator=resumed_generator,
         config=config,
         run_dir=tmp_path,
-        resolved_run_config=resolved,
+        resolved_run_config=resume_resolved,
         identities=identities,
         base_checkpoint_sha256="5" * 64,
         resume_path=tmp_path / "last.pt",
@@ -560,6 +575,14 @@ def test_resume_reconciles_durable_epoch_before_sampler_finished_checkpoint(
     assert resumed_sampler.state_dict().epoch == 2
     assert (tmp_path / "metrics/epochs/epoch-0001.json").is_file()
     assert (tmp_path / "run-complete.json").is_file()
+    assert (tmp_path / "resolved-run-config.json").read_bytes() == stable_config_bytes
+    assert attestation.training_config_sha256 == sha256_file(
+        tmp_path / "resolved-run-config.json"
+    )
+    assert (
+        torch.load(tmp_path / "last.pt", map_location="cpu")["config"]
+        == resume_resolved
+    )
 
 
 @pytest.mark.parametrize("corruption", ["missing", "mismatched"])

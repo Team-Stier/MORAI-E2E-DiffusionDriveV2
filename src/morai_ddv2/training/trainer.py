@@ -29,7 +29,11 @@ from .contracts import (
     StepMetrics,
     TrainingBoundaryError,
 )
-from .checkpoint import load_training_checkpoint, save_training_checkpoint
+from .checkpoint import (
+    inspect_training_checkpoint,
+    load_training_checkpoint,
+    save_training_checkpoint,
+)
 from .dataset import TrainingConfig
 from .freeze import (
     assert_training_boundary,
@@ -595,19 +599,48 @@ def _validate_resume_epoch_binding(
         )
 
 
-def _validate_resume_config(path: Path, expected: Mapping[str, Any]) -> None:
-    try:
-        payload = torch.load(str(Path(path)), map_location="cpu")
-    except Exception as error:
-        raise ResumeContractError(
-            "unable to inspect resume checkpoint config"
-        ) from error
-    if (
-        not isinstance(payload, Mapping)
-        or not isinstance(payload.get("config"), Mapping)
-        or dict(payload["config"]) != dict(expected)
-    ):
-        raise ResumeContractError("resume checkpoint config does not match invocation")
+def _resume_checkpoint_sha256(
+    path: Path, resolved_run_config: Mapping[str, Any]
+) -> str:
+    observed = sha256_file(Path(path))
+    bound = resolved_run_config.get("resume_checkpoint_sha256")
+    if bound is not None and bound != observed:
+        raise ResumeContractError("resume checkpoint SHA-256 changed")
+    return observed
+
+
+def _publish_resolved_run_config(
+    path: Path, resolved_run_config: Mapping[str, Any]
+) -> None:
+    payload = canonical_json_bytes(dict(resolved_run_config))
+    path = Path(path)
+    if path.exists():
+        if not path.is_file():
+            raise IntegrityError("existing resolved run config is not a file")
+        try:
+            existing_payload = path.read_bytes()
+            existing = json.loads(
+                existing_payload.decode("utf-8"),
+                parse_constant=_reject_json_constant,
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            raise IntegrityError("existing resolved run config is invalid") from error
+        if (
+            not isinstance(existing, Mapping)
+            or canonical_json_bytes(dict(existing)) != existing_payload
+        ):
+            raise IntegrityError("existing resolved run config is not canonical")
+        previous_identity = dict(existing)
+        current_identity = dict(resolved_run_config)
+        previous_identity.pop("resume_checkpoint_sha256", None)
+        current_identity.pop("resume_checkpoint_sha256", None)
+        if previous_identity != current_identity:
+            raise IntegrityError(
+                "existing resolved run config conflicts with requested bytes"
+            )
+        if existing_payload == payload:
+            return
+    atomic_write_bytes(path, payload)
 
 
 def _bounded_validation_samples(dataloader: DataLoader, maximum: Optional[int]):
@@ -650,7 +683,9 @@ def _fit_bounded(
         best_micro_ade = math.inf
         accumulator = _empty_accumulator(0)
     else:
-        _validate_resume_config(Path(resume_path), resolved_run_config)
+        resume_checkpoint_sha256 = _resume_checkpoint_sha256(
+            Path(resume_path), resolved_run_config
+        )
         state = load_training_checkpoint(
             Path(resume_path),
             model=model,
@@ -659,6 +694,8 @@ def _fit_bounded(
             sampler=sampler,
             manifest=manifest,
             expected_base_checkpoint_sha256=base_checkpoint_sha256,
+            expected_checkpoint_sha256=resume_checkpoint_sha256,
+            expected_config=resolved_run_config,
         )
         if state.completed_epoch_record_sha256 is not None:
             raise ResumeContractError(
@@ -852,13 +889,29 @@ def fit(
         raise TrainingBoundaryError("clock policy version must be exactly 1")
 
     run_dir = Path(run_dir)
-    resolved_payload = canonical_json_bytes(dict(resolved_run_config))
-    _publish_exact(
-        run_dir
-        / ("debug/resolved-run-config.json" if bounded else "resolved-run-config.json"),
-        resolved_payload,
-        label="resolved run config",
+    published_run_config = dict(resolved_run_config)
+    if not bounded:
+        published_run_config.pop("resume_checkpoint_sha256", None)
+    resolved_payload = canonical_json_bytes(published_run_config)
+    resolved_path = run_dir / (
+        "debug/resolved-run-config.json" if bounded else "resolved-run-config.json"
     )
+    if resume_path is not None:
+        resume_checkpoint_sha256 = _resume_checkpoint_sha256(
+            Path(resume_path), resolved_run_config
+        )
+        inspect_training_checkpoint(
+            Path(resume_path),
+            expected_checkpoint_sha256=resume_checkpoint_sha256,
+            expected_base_checkpoint_sha256=base_checkpoint_sha256,
+            expected_config=resolved_run_config,
+        )
+        if bounded:
+            _publish_resolved_run_config(resolved_path, resolved_run_config)
+        else:
+            _publish_exact(resolved_path, resolved_payload, label="resolved run config")
+    else:
+        _publish_exact(resolved_path, resolved_payload, label="resolved run config")
     training_config_sha256 = hashlib.sha256(resolved_payload).hexdigest()
     training_manifest_sha256 = _require_identity(identities, "training_manifest_sha256")
     resolved_domain_sha256 = _require_identity(identities, "resolved_domain_sha256")
@@ -910,7 +963,9 @@ def fit(
         best_epoch = 0
         completed_epoch_hash: Optional[str] = None
     else:
-        _validate_resume_config(Path(resume_path), resolved_run_config)
+        resume_checkpoint_sha256 = _resume_checkpoint_sha256(
+            Path(resume_path), resolved_run_config
+        )
         state = load_training_checkpoint(
             Path(resume_path),
             model=model,
@@ -919,6 +974,8 @@ def fit(
             sampler=sampler,
             manifest=manifest,
             expected_base_checkpoint_sha256=base_checkpoint_sha256,
+            expected_checkpoint_sha256=resume_checkpoint_sha256,
+            expected_config=resolved_run_config,
         )
         if state.epoch > config.epochs:
             raise ResumeContractError("resume epoch exceeds configured epochs")
