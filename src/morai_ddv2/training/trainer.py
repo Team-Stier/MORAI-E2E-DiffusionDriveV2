@@ -366,6 +366,20 @@ def train_one_epoch(
     reapplied = configure_training_boundary(model)
     if reapplied != manifest:
         raise TrainingBoundaryError("freeze manifest changed at epoch boundary")
+    named_parameters = dict(model.named_parameters())
+    try:
+        trainable_devices = {
+            named_parameters[name].device for name in manifest.trainable_parameters
+        }
+    except KeyError as error:
+        raise TrainingBoundaryError(
+            f"unknown trainable parameter at epoch boundary: {error.args[0]}"
+        ) from error
+    if len(trainable_devices) != 1:
+        raise TrainingBoundaryError(
+            "trainable model parameters must share exactly one device"
+        )
+    trainable_device = next(iter(trainable_devices))
     current = _validated_accumulator(accumulator, sampler, epoch)
     if current.completed_samples > 0 and resume_rng is None:
         raise ResumeContractError(
@@ -397,6 +411,16 @@ def train_one_epoch(
             batch = next(iterator)
         except StopIteration:
             break
+        batch = dict(batch)
+        batch["features"] = {
+            name: value.to(device=trainable_device)
+            if isinstance(value, torch.Tensor)
+            else value
+            for name, value in batch["features"].items()
+        }
+        trajectory = batch["trajectory"]
+        if isinstance(trajectory, torch.Tensor):
+            batch["trajectory"] = trajectory.to(device=trainable_device)
         metrics = train_step(
             model,
             batch,

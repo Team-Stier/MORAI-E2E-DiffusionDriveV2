@@ -1524,6 +1524,64 @@ def test_train_one_epoch_retries_overflow_without_advancing_committed_state(
     assert model._backbone.image_encoder.training
 
 
+def test_train_one_epoch_moves_cpu_batch_to_model_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from morai_ddv2.training import trainer as trainer_module
+
+    model = _ResumeModel().to(device="meta")
+    manifest = configure_training_boundary(model)
+    dataset = _ResumeDataset(size=4)
+    sampler = StatefulPermutationSampler(dataset, seed=821)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(822)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=2,
+        sampler=sampler,
+        num_workers=0,
+        generator=generator,
+    )
+    observed_sample_ids = []
+
+    def fake_step(_model, batch, *_args, **_kwargs):
+        tensors = (*batch["features"].values(), batch["trajectory"])
+        assert all(tensor.device.type == "meta" for tensor in tensors)
+        assert all(tensor.dtype == torch.float32 for tensor in tensors)
+        observed_sample_ids.extend(batch["metadata"]["sample_id"])
+        return StepMetrics(1.0, 2.0, 3.0, 4.0, True)
+
+    monkeypatch.setattr(trainer_module, "train_step", fake_step)
+
+    metrics = train_one_epoch(
+        model=model,
+        dataloader=dataloader,
+        sampler=sampler,
+        optimizer=SimpleNamespace(),
+        scaler=SimpleNamespace(),
+        reference={},
+        manifest=manifest,
+        amp=False,
+        grad_clip_norm=1.0,
+        trajectory_weight=12.0,
+        preservation_weight=1.0e-3,
+        epoch=0,
+        global_step=5,
+        accumulator=_zero_accumulator(),
+    )
+
+    assert sorted(observed_sample_ids) == [
+        "sample-00",
+        "sample-01",
+        "sample-02",
+        "sample-03",
+    ]
+    assert metrics.global_step == 7
+    assert metrics.completed_batches == 2
+    assert metrics.completed_samples == 4
+    assert sampler.state_dict().committed_cursor == 4
+
+
 def test_train_one_epoch_requires_saved_rng_for_committed_mid_epoch_progress(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
