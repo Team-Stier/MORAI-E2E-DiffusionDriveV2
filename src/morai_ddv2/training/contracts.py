@@ -4,9 +4,9 @@ from dataclasses import dataclass
 import math
 from typing import Any, Optional, TYPE_CHECKING
 
-import torch
-
 if TYPE_CHECKING:
+    import torch
+
     from .loss import FinetuneLoss
     from .sampler import SamplerState
 
@@ -80,6 +80,8 @@ class StepMetrics:
         *,
         optimizer_step_applied: bool,
     ) -> StepMetrics:
+        import torch
+
         if type(optimizer_step_applied) is not bool:
             raise TrainingBoundaryError("optimizer step application must be a bool")
 
