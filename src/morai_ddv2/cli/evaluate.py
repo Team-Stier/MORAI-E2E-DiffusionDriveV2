@@ -23,6 +23,7 @@ from morai_ddv2.training.dataset import (
 )
 from morai_ddv2.training.freeze import build_optimizer, configure_training_boundary
 from morai_ddv2.training.metrics import validation_report_json_bytes
+from morai_ddv2.training.sampler import ResumeContractError
 from morai_ddv2.training.validation import validate_selector_b1
 from morai_ddv2.upstream import SelAssets, load_pdm_free_sel_network
 
@@ -30,6 +31,7 @@ from .train import (
     _CHECKPOINT_IDENTITY_FIELDS,
     _DDV2_COMMIT,
     _PROJECT_ROOT,
+    _SHA256,
     _VALIDATOR_COMMIT,
     _git_output,
     _manifest_statistics,
@@ -38,17 +40,31 @@ from .train import (
     _validate_production_domain,
     _validate_production_manifest,
     assert_runtime_contract,
-    build_resolved_run_config,
 )
 
 
 _DEFAULT_TRAINING_CONFIG = (
     _PROJECT_ROOT / "configs/training/morai-ddv2-encoder-fusion-v1.yaml"
 )
+_CURRENT_CHECKPOINT_IDENTITY_FIELDS = tuple(
+    name for name in _CHECKPOINT_IDENTITY_FIELDS if name != "training_source_commit"
+)
+_RESOLVED_CONFIG_FIELDS = {
+    "schema_version",
+    "training",
+    "identities",
+    "smoke_bounds",
+}
+_SMOKE_BOUND_FIELDS = {
+    "max_epochs",
+    "max_train_batches",
+    "max_validation_samples",
+}
 
 
 @dataclass(frozen=True)
 class EvaluationPreflight:
+    config: TrainingConfig
     manifest: VerifiedManifest
     assets: SelAssets
     identities: Mapping[str, str]
@@ -58,6 +74,59 @@ class EvaluationPreflight:
     training_checkpoint: Path
     drop_statistics: Mapping[str, int]
     sync_statistics: Mapping[str, Any]
+
+
+def _validated_checkpoint_config(
+    value: Mapping[str, Any],
+) -> tuple[TrainingConfig, Mapping[str, Any], Mapping[str, str]]:
+    if not isinstance(value, Mapping):
+        raise ResumeContractError("training checkpoint config is invalid")
+    fields = set(value)
+    if (
+        fields
+        not in (
+            _RESOLVED_CONFIG_FIELDS,
+            _RESOLVED_CONFIG_FIELDS | {"resume_checkpoint_sha256"},
+        )
+        or type(value.get("schema_version")) is not int
+        or value["schema_version"] != 1
+    ):
+        raise ResumeContractError("training checkpoint config schema is invalid")
+    training = value.get("training")
+    if not isinstance(training, Mapping) or tuple(training) != tuple(
+        TrainingConfig.__dataclass_fields__
+    ):
+        raise ResumeContractError("training checkpoint training config is invalid")
+    try:
+        config = TrainingConfig(**dict(training))
+    except (TypeError, ValueError) as error:
+        raise ResumeContractError(
+            "training checkpoint training config is invalid"
+        ) from error
+    identities = value.get("identities")
+    if (
+        not isinstance(identities, Mapping)
+        or set(identities) != set(_CHECKPOINT_IDENTITY_FIELDS)
+        or any(type(item) is not str for item in identities.values())
+    ):
+        raise ResumeContractError("training checkpoint identities are invalid")
+    smoke_bounds = value.get("smoke_bounds")
+    if (
+        not isinstance(smoke_bounds, Mapping)
+        or set(smoke_bounds) != _SMOKE_BOUND_FIELDS
+    ):
+        raise ResumeContractError("training checkpoint smoke bounds are invalid")
+    if any(
+        bound is not None and (type(bound) is not int or bound <= 0)
+        for bound in smoke_bounds.values()
+    ):
+        raise ResumeContractError("training checkpoint smoke bounds are invalid")
+    resume_sha256 = value.get("resume_checkpoint_sha256")
+    if resume_sha256 is not None and (
+        type(resume_sha256) is not str or _SHA256.fullmatch(resume_sha256) is None
+    ):
+        raise ResumeContractError("training checkpoint resume hash is invalid")
+    return config, dict(value), dict(identities)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -117,7 +186,7 @@ def preflight_evaluation(arguments: argparse.Namespace) -> EvaluationPreflight:
         document["source_code_commit"],
         "preprocessing source commit",
     )
-    training_commit = _require_commit_object(
+    evaluation_commit = _require_commit_object(
         _PROJECT_ROOT,
         _git_output(_PROJECT_ROOT, ("rev-parse", "HEAD"), "evaluation source commit"),
         "evaluation source commit",
@@ -127,7 +196,7 @@ def preflight_evaluation(arguments: argparse.Namespace) -> EvaluationPreflight:
     if not checkpoint.is_file():
         raise IntegrityError("training checkpoint is not a file")
     checkpoint_sha256 = sha256_file(checkpoint)
-    identities = {
+    current_identities = {
         "domain_id": domain_id,
         "training_manifest_sha256": manifest.manifest_sha256,
         "resolved_domain_sha256": resolved.sha256,
@@ -136,31 +205,34 @@ def preflight_evaluation(arguments: argparse.Namespace) -> EvaluationPreflight:
         "base_checkpoint_sha256": base_sha256,
         "ddv2_source_commit": _DDV2_COMMIT,
         "validator_source_commit": _VALIDATOR_COMMIT,
-        "training_checkpoint_sha256": checkpoint_sha256,
         "preprocessing_source_commit": preprocessing_commit,
-        "training_source_commit": training_commit,
-        "evaluation_source_commit": training_commit,
     }
     checkpoint_identities = {
-        name: identities[name] for name in _CHECKPOINT_IDENTITY_FIELDS
+        name: current_identities[name] for name in _CURRENT_CHECKPOINT_IDENTITY_FIELDS
     }
-    checkpoint_config = build_resolved_run_config(
-        config=TrainingConfig(),
-        identities=checkpoint_identities,
-        resume_checkpoint_sha256=None,
-        max_epochs=None,
-        max_train_batches=None,
-        max_validation_samples=None,
-    )
-    inspect_training_checkpoint(
+    inspected_config = inspect_training_checkpoint(
         checkpoint,
         expected_checkpoint_sha256=checkpoint_sha256,
         expected_base_checkpoint_sha256=base_sha256,
-        expected_config=checkpoint_config,
         expected_identities=checkpoint_identities,
     )
+    config, checkpoint_config, stored_identities = _validated_checkpoint_config(
+        inspected_config
+    )
+    training_source_commit = _require_commit_object(
+        _PROJECT_ROOT,
+        stored_identities["training_source_commit"],
+        "training checkpoint source commit",
+    )
+    identities = {
+        **current_identities,
+        "training_checkpoint_sha256": checkpoint_sha256,
+        "training_source_commit": training_source_commit,
+        "evaluation_source_commit": evaluation_commit,
+    }
     drops, sync = _manifest_statistics(manifest)
     return EvaluationPreflight(
+        config=config,
         manifest=manifest,
         assets=assets,
         identities=identities,
@@ -209,7 +281,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     model, raw_checkpoint = load_pdm_free_sel_network(preflight.assets, device)
     if raw_checkpoint.checkpoint_sha256 != preflight.base_checkpoint_sha256:
         raise IntegrityError("loaded base checkpoint identity changed after preflight")
-    config = TrainingConfig()
+    config = preflight.config
     train_loader, _, sampler, _ = build_dataloaders(preflight.manifest, config)
     del train_loader
     manifest = configure_training_boundary(model)
@@ -220,6 +292,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         weight_decay=config.weight_decay,
     )
     scaler = torch.cuda.amp.GradScaler(enabled=config.amp and device.type == "cuda")
+    checkpoint_config_identity = dict(preflight.checkpoint_config)
+    checkpoint_config_identity.pop("resume_checkpoint_sha256", None)
     load_training_checkpoint(
         preflight.training_checkpoint,
         model=model,
@@ -229,7 +303,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         manifest=manifest,
         expected_base_checkpoint_sha256=preflight.base_checkpoint_sha256,
         expected_checkpoint_sha256=preflight.identities["training_checkpoint_sha256"],
-        expected_config=preflight.checkpoint_config,
+        expected_config=checkpoint_config_identity,
         expected_identities=preflight.checkpoint_identities,
     )
     samples = MoraiTrainingDataset(preflight.manifest, split="validation")

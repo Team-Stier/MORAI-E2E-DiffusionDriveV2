@@ -394,17 +394,18 @@ def inspect_training_checkpoint(
     expected_base_checkpoint_sha256: str,
     expected_config: Optional[Mapping[str, Any]] = None,
     expected_identities: Optional[Mapping[str, str]] = None,
-) -> None:
+) -> Mapping[str, Any]:
     payload = _load_payload(
         Path(path), expected_checkpoint_sha256=expected_checkpoint_sha256
     )
-    _validated_checkpoint_payload(
+    validated = _validated_checkpoint_payload(
         payload,
         expected_base_checkpoint_sha256=expected_base_checkpoint_sha256,
         expected_checkpoint_sha256=expected_checkpoint_sha256,
         expected_config=expected_config,
         expected_identities=expected_identities,
     )
+    return _owned_value(validated["config"])
 
 
 def _validated_model_mutable_state(

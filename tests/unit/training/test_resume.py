@@ -176,13 +176,14 @@ def test_model_free_checkpoint_inspection_accepts_bound_resume_identity_and_reje
     resume_config = dict(stored_config)
     resume_config["resume_checkpoint_sha256"] = checkpoint_sha256
 
-    inspect_training_checkpoint(
+    inspected = inspect_training_checkpoint(
         checkpoint,
         expected_checkpoint_sha256=checkpoint_sha256,
         expected_base_checkpoint_sha256="3" * 64,
         expected_config=resume_config,
         expected_identities={"training_manifest_sha256": "1" * 64},
     )
+    assert inspected == stored_config
 
     checkpoint.write_bytes(checkpoint.read_bytes() + b"replaced")
     with pytest.raises(ResumeContractError, match="SHA-256"):
