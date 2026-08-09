@@ -1,0 +1,13 @@
+seed: 20260806
+epochs: 30
+batch_size: 8
+num_workers: 4
+learning_rate: 1.0e-5
+weight_decay: 1.0e-4
+amp: true
+grad_clip_norm: 1.0
+trajectory_weight: 12.0
+preservation_weight: 1.0e-3
+validation_batch_size: 1
+validation_run_id: morai-ddv2-v1-oracle-command-validation-v1
+checkpoint_interval_steps: 100
