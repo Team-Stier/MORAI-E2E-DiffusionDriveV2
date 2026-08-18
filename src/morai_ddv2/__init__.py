@@ -1,3 +1,1 @@
-from __future__ import annotations
-
-__version__ = "0.1.0"
+"""MORAI ROS bag fine-tuning for DiffusionDriveV2."""

@@ -5,9 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "morai-ddv2"
 version = "0.1.0"
-description = "Deterministic MORAI DiffusionDriveV2 preprocessing and training"
+description = "ROS bag fine-tuning for DiffusionDriveV2"
 requires-python = ">=3.8,<3.10"
-dependencies = []
+dependencies = ["cloudpickle", "h5py>=3.10", "numpy"]
+
+[project.scripts]
+morai-extract = "morai_ddv2.extract:main"
+morai-train = "morai_ddv2.train:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -17,8 +21,4 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = [
-    "gpu: requires a working CUDA-capable GPU and driver",
-    "realbag: requires local production ROS bag data",
-    "upstream: requires pinned upstream source checkouts and model assets",
-]
+pythonpath = ["src"]
