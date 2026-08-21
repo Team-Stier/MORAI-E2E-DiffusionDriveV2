@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch import nn
 
+import morai_ddv2.train as train_module
 from morai_ddv2.model import (
     CHECKPOINT_PREFIX,
     VOCAB_KEY,
@@ -15,7 +16,7 @@ from morai_ddv2.model import (
     supervised_trajectory_loss,
 )
 from morai_ddv2.train import MoraiHDF5Dataset
-from morai_ddv2.training import TRAINABLE_PREFIXES, TrainingBoundaryError
+from morai_ddv2.training import FinetuneLoss, TRAINABLE_PREFIXES, TrainingBoundaryError
 
 
 def _raw_state():
@@ -205,6 +206,46 @@ def test_supervised_path_bypasses_public_sel_forward():
     assert model._trajectory_head.public_forward_calls == 0
     assert model._trajectory_head.loss_computer.calls == 1
     assert model._backbone.image_encoder.weight.grad is not None
+
+
+def test_evaluation_metrics_are_deterministic_and_restore_modes(monkeypatch):
+    model = nn.Sequential(nn.Linear(1, 1), nn.Dropout())
+    model.eval()
+    model[0].train()
+    original_modes = tuple(module.training for module in model.modules())
+    target = torch.zeros(2, 8, 3)
+    prediction = target.clone()
+    prediction[..., 0] = 2.0
+
+    def output(*args, **kwargs):
+        assert kwargs["deterministic"] is True
+        return torch.tensor(3.0), prediction
+
+    monkeypatch.setattr(train_module, "supervised_trajectory_output", output)
+    monkeypatch.setattr(
+        train_module,
+        "compose_finetune_loss",
+        lambda *args: FinetuneLoss(
+            torch.tensor(36.0), torch.tensor(3.0), torch.tensor(0.0)
+        ),
+    )
+    batch = {
+        "camera_feature": torch.zeros(2, 3, 256, 1024),
+        "lidar_feature": torch.zeros(2, 1, 256, 256),
+        "status_feature": torch.zeros(2, 8),
+        "trajectory": target,
+    }
+    metrics = train_module._evaluate(model, [batch], torch.device("cpu"), False, {}, None)
+
+    assert tuple(module.training for module in model.modules()) == original_modes
+    assert metrics == {
+        "samples": 2,
+        "total_loss": 36.0,
+        "trajectory_loss": 3.0,
+        "preservation_loss": 0.0,
+        "ade": 2.0,
+        "fde": 2.0,
+    }
 
 
 def test_hdf5_dataset_reconstructs_quantized_inputs(tmp_path):

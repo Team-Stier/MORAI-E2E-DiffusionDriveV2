@@ -210,13 +210,15 @@ def _sine_xy_embedding(points: torch.Tensor) -> torch.Tensor:
     return torch.cat((y, x), dim=-1)
 
 
-def supervised_trajectory_loss(
+def supervised_trajectory_output(
     model: nn.Module,
     camera: torch.Tensor,
     lidar: torch.Tensor,
     status: torch.Tensor,
     target_trajectory: torch.Tensor,
-) -> torch.Tensor:
+    *,
+    deterministic: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the official learned path without invoking SEL's PDM-backed forward."""
 
     _validate_batch(camera, lidar, status, target_trajectory)
@@ -262,9 +264,18 @@ def supervised_trajectory_loss(
     normalized_anchor = anchor.clone()
     normalized_anchor[..., 0] /= 50.0
     normalized_anchor[..., 1] /= 20.0
-    timesteps = torch.randint(0, 50, (batch_size,), device=camera.device)
+    timesteps = (
+        torch.zeros(batch_size, dtype=torch.long, device=camera.device)
+        if deterministic
+        else torch.randint(0, 50, (batch_size,), device=camera.device)
+    )
+    noise = (
+        torch.zeros_like(normalized_anchor)
+        if deterministic
+        else torch.randn_like(normalized_anchor)
+    )
     noisy = head.diffusion_scheduler.add_noise(
-        normalized_anchor, torch.randn_like(normalized_anchor), timesteps
+        normalized_anchor, noise, timesteps
     )
     decoder_points = noisy.float().clamp(-1.0, 1.0)
     decoder_points[..., 0] *= 50.0
@@ -300,7 +311,23 @@ def supervised_trajectory_loss(
     )
     if not isinstance(loss, torch.Tensor) or loss.ndim != 0 or not torch.isfinite(loss).item():
         raise TrainingBoundaryError("official trajectory loss must be a finite scalar")
-    return loss
+    selected = classification.squeeze(1).argmax(dim=1)
+    prediction = regression[torch.arange(batch_size, device=camera.device), selected]
+    if tuple(prediction.shape) != (batch_size, 8, 3) or not torch.isfinite(prediction).all().item():
+        raise TrainingBoundaryError("official predicted trajectory must be finite [B,8,3]")
+    return loss, prediction
+
+
+def supervised_trajectory_loss(
+    model: nn.Module,
+    camera: torch.Tensor,
+    lidar: torch.Tensor,
+    status: torch.Tensor,
+    target_trajectory: torch.Tensor,
+) -> torch.Tensor:
+    return supervised_trajectory_output(
+        model, camera, lidar, status, target_trajectory
+    )[0]
 
 
 def save_checkpoint_atomic(
@@ -357,4 +384,5 @@ __all__ = (
     "normalize_checkpoint_state",
     "save_checkpoint_atomic",
     "supervised_trajectory_loss",
+    "supervised_trajectory_output",
 )

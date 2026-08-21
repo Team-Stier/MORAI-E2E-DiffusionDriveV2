@@ -111,13 +111,12 @@ def _read_ego_states(
     expected_ns = int(round(1_000_000_000.0 / bag_hz))
     tolerance_ns = max(1_000_000, expected_ns // 4)
     deltas = np.diff(np.asarray([state.timestamp_ns for state in states], dtype=np.int64))
-    invalid = np.flatnonzero(np.abs(deltas - expected_ns) > tolerance_ns)
-    if invalid.size:
-        index = int(invalid[0])
+    median_delta_ns = int(np.median(deltas))
+    if abs(median_delta_ns - expected_ns) > tolerance_ns:
         raise ValueError(
-            "Ego Header cadence is not near {:.6g} Hz at frames {}->{} "
+            "median Ego Header cadence is not near {:.6g} Hz "
             "({:.6f} s); set --bag-hz to the recording rate".format(
-                bag_hz, index, index + 1, float(deltas[index]) / 1_000_000_000.0
+                bag_hz, float(median_delta_ns) / 1_000_000_000.0
             )
         )
     return tuple(states)

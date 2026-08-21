@@ -16,7 +16,7 @@ from .model import (
     configure_finetuning,
     load_official_model,
     save_checkpoint_atomic,
-    supervised_trajectory_loss,
+    supervised_trajectory_output,
 )
 from .training.loss import compose_finetune_loss, snapshot_source_parameters
 
@@ -98,6 +98,8 @@ def _parse_args(argv=None):
         description="Fine-tune official DiffusionDriveV2 SEL sensor fusion on MORAI HDF5"
     )
     parser.add_argument("dataset", type=Path)
+    parser.add_argument("--test-dataset", type=Path)
+    parser.add_argument("--metrics-jsonl", type=Path)
     parser.add_argument(
         "--checkout", type=Path, default=REPOSITORY_ROOT / "third_party/DiffusionDriveV2"
     )
@@ -151,6 +153,62 @@ def _resolve_device(value: str) -> torch.device:
     return device
 
 
+def _trajectory_metrics(
+    prediction: torch.Tensor, target: torch.Tensor
+) -> tuple[float, float]:
+    error = torch.linalg.vector_norm(prediction[..., :2] - target[..., :2], dim=-1)
+    return error.mean().item(), error[:, -1].mean().item()
+
+
+def _evaluate(model, loader, device, amp, reference, manifest):
+    modes = tuple((module, module.training) for module in model.modules())
+    model.eval()
+    totals = np.zeros(5, dtype=np.float64)
+    sample_count = 0
+    try:
+        with torch.no_grad():
+            for batch in loader:
+                camera = batch["camera_feature"].to(device, non_blocking=amp)
+                lidar = batch["lidar_feature"].to(device, non_blocking=amp)
+                status = batch["status_feature"].to(device, non_blocking=amp)
+                trajectory = batch["trajectory"].to(device, non_blocking=amp)
+                with torch.cuda.amp.autocast(enabled=amp):
+                    trajectory_loss, prediction = supervised_trajectory_output(
+                        model,
+                        camera,
+                        lidar,
+                        status,
+                        trajectory,
+                        deterministic=True,
+                    )
+                    loss = compose_finetune_loss(
+                        trajectory_loss, model, reference, manifest
+                    )
+                ade, fde = _trajectory_metrics(prediction, trajectory)
+                count = camera.shape[0]
+                sample_count += count
+                totals += count * np.array(
+                    [
+                        loss.total.item(),
+                        loss.trajectory.item(),
+                        loss.preservation.item(),
+                        ade,
+                        fde,
+                    ]
+                )
+    finally:
+        for module, training in modes:
+            module.training = training
+    return {
+        "samples": sample_count,
+        "total_loss": totals[0] / sample_count,
+        "trajectory_loss": totals[1] / sample_count,
+        "preservation_loss": totals[2] / sample_count,
+        "ade": totals[3] / sample_count,
+        "fde": totals[4] / sample_count,
+    }
+
+
 def main(argv=None) -> int:
     args = _parse_args(argv)
     random.seed(args.seed)
@@ -161,6 +219,7 @@ def main(argv=None) -> int:
     device = _resolve_device(args.device)
 
     dataset = MoraiHDF5Dataset(args.dataset)
+    test_dataset = MoraiHDF5Dataset(args.test_dataset) if args.test_dataset else None
     generator = torch.Generator().manual_seed(args.seed)
     loader = DataLoader(
         dataset,
@@ -169,6 +228,17 @@ def main(argv=None) -> int:
         num_workers=args.workers,
         pin_memory=device.type == "cuda",
         generator=generator,
+    )
+    test_loader = (
+        DataLoader(
+            test_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.workers,
+            pin_memory=device.type == "cuda",
+        )
+        if test_dataset is not None
+        else None
     )
     model, checkpoint = load_official_model(
         args.checkout, args.checkpoint, args.backbone, args.anchor, device
@@ -186,10 +256,15 @@ def main(argv=None) -> int:
     # The official SEL decoder overflows during the first backward pass at
     # GradScaler's 65536 default; 128 retains FP16 range on the pinned model.
     scaler = torch.cuda.amp.GradScaler(enabled=amp, init_scale=128.0)
+    metrics_stream = None
+    if args.metrics_jsonl:
+        metrics_path = args.metrics_jsonl.expanduser().resolve()
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        metrics_stream = metrics_path.open("a", encoding="utf-8")
 
     try:
         for epoch in range(1, args.epochs + 1):
-            totals = np.zeros(3, dtype=np.float64)
+            totals = np.zeros(5, dtype=np.float64)
             sample_count = 0
             for batch in loader:
                 camera = batch["camera_feature"].to(device, non_blocking=amp)
@@ -198,7 +273,7 @@ def main(argv=None) -> int:
                 trajectory = batch["trajectory"].to(device, non_blocking=amp)
                 optimizer.zero_grad(set_to_none=True)
                 with torch.cuda.amp.autocast(enabled=amp):
-                    trajectory_loss = supervised_trajectory_loss(
+                    trajectory_loss, prediction = supervised_trajectory_output(
                         model, camera, lidar, status, trajectory
                     )
                     loss = compose_finetune_loss(
@@ -210,6 +285,7 @@ def main(argv=None) -> int:
                 scaler.step(optimizer)
                 scaler.update()
 
+                ade, fde = _trajectory_metrics(prediction.detach(), trajectory)
                 count = camera.shape[0]
                 sample_count += count
                 totals += count * np.array(
@@ -217,23 +293,36 @@ def main(argv=None) -> int:
                         loss.total.detach().item(),
                         loss.trajectory.detach().item(),
                         loss.preservation.detach().item(),
+                        ade,
+                        fde,
                     ]
                 )
-            print(
-                json.dumps(
-                    {
-                        "epoch": epoch,
-                        "samples": sample_count,
-                        "total_loss": totals[0] / sample_count,
-                        "trajectory_loss": totals[1] / sample_count,
-                        "preservation_loss": totals[2] / sample_count,
-                    },
-                    sort_keys=True,
-                ),
-                flush=True,
-            )
+            record = {
+                "epoch": epoch,
+                "train": {
+                    "samples": sample_count,
+                    "total_loss": totals[0] / sample_count,
+                    "trajectory_loss": totals[1] / sample_count,
+                    "preservation_loss": totals[2] / sample_count,
+                    "ade": totals[3] / sample_count,
+                    "fde": totals[4] / sample_count,
+                },
+            }
+            if test_loader is not None:
+                record["test"] = _evaluate(
+                    model, test_loader, device, amp, reference, manifest
+                )
+            line = json.dumps(record, sort_keys=True)
+            print(line, flush=True)
+            if metrics_stream is not None:
+                metrics_stream.write(line + "\n")
+                metrics_stream.flush()
     finally:
         dataset.close()
+        if test_dataset is not None:
+            test_dataset.close()
+        if metrics_stream is not None:
+            metrics_stream.close()
 
     output = save_checkpoint_atomic(args.output, checkpoint, model)
     print(output)
